@@ -1,6 +1,7 @@
 const express = require("express");
 const bcrypt = require("bcrypt");
 const pool = require("./db");
+const { runMigrations } = require("./migrate");
 const http = require("http");
 const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
@@ -48,6 +49,9 @@ io.use((socket, next) => {
 
 io.on("connection", (socket) => {
   console.log("A user connected:", socket.id);
+
+  // Personal room so we can notify this user about activity in any of their chats.
+  socket.join(`user_${socket.userId}`);
 
   socket.on("join_room", async (room) => {
     try {
@@ -102,17 +106,20 @@ io.on("connection", (socket) => {
     try {
       const conversationId = Number(data.room.replace("conversation_", ""));
 
-      const membership = await pool.query(
+      const members = await pool.query(
         `
-      SELECT 1
+      SELECT user_id
       FROM conversation_members
       WHERE conversation_id = $1
-      AND user_id = $2
       `,
-        [conversationId, socket.userId],
+        [conversationId],
       );
 
-      if (membership.rows.length === 0) {
+      const isMember = members.rows.some(
+        (member) => member.user_id === socket.userId,
+      );
+
+      if (!isMember) {
         console.log(
           `User ${socket.userId} tried to send to unauthorized room ${data.room}`,
         );
@@ -120,7 +127,14 @@ io.on("connection", (socket) => {
         return;
       }
 
-      if (data.keepHistory) {
+      // The database decides whether this chat saves history, not the client.
+      const settings = await pool.query(
+        `SELECT keep_history FROM conversations WHERE id = $1`,
+        [conversationId],
+      );
+      const keepHistory = settings.rows[0]?.keep_history === true;
+
+      if (keepHistory) {
         await pool.query(
           `
         INSERT INTO messages (room, username, content)
@@ -134,8 +148,46 @@ io.on("connection", (socket) => {
         room: data.room,
         username: socket.username,
         message: data.message,
-        keepHistory: data.keepHistory,
+        keepHistory,
       });
+
+      // Track the latest activity and the preview shown in the chat list.
+      // The preview text is only stored when this chat saves history.
+      await pool.query(
+        `
+        UPDATE conversations
+        SET last_message_at = NOW(),
+            last_message_text = $2,
+            last_message_sender = $3
+        WHERE id = $1
+        `,
+        [
+          conversationId,
+          keepHistory ? String(data.message).slice(0, 200) : null,
+          keepHistory ? socket.username : null,
+        ],
+      );
+
+      // Everyone except the sender now has one more unread message.
+      await pool.query(
+        `
+        UPDATE conversation_members
+        SET unread_count = unread_count + 1
+        WHERE conversation_id = $1
+          AND user_id <> $2
+        `,
+        [conversationId, socket.userId],
+      );
+
+      // Tell every member (even if they have another chat open) so their list can reorder.
+      for (const member of members.rows) {
+        io.to(`user_${member.user_id}`).emit("conversation_activity", {
+          conversationId,
+          room: data.room,
+          username: socket.username,
+          message: data.message,
+        });
+      }
     } catch (error) {
       console.log("Message error:", error);
     }
@@ -199,7 +251,7 @@ app.post("/signup", async (req, res) => {
       `
       INSERT INTO users (username, email, password_hash)
       VALUES ($1, $2, $3)
-      RETURNING id, username, email
+      RETURNING id, username, email, public_id
       `,
       [username, email, passwordHash],
     );
@@ -259,7 +311,7 @@ app.post("/login", async (req, res) => {
       },
       process.env.JWT_SECRET,
       {
-        expiresIn: "1h",
+        expiresIn: "7d",
       },
     );
 
@@ -270,6 +322,7 @@ app.post("/login", async (req, res) => {
         id: user.id,
         username: user.username,
         email: user.email,
+        public_id: user.public_id,
       },
     });
   } catch (error) {
@@ -281,28 +334,63 @@ app.post("/login", async (req, res) => {
   }
 });
 
-app.get("/users/search", authenticateToken, async (req, res) => {
-  const username = req.query.username;
+app.get("/me", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, username, email, public_id FROM users WHERE id = $1`,
+      [req.user.userId],
+    );
 
-  if (!username) {
+    if (result.rows.length === 0) {
+      return res.status(401).json({
+        message: "User no longer exists",
+      });
+    }
+
+    res.json({ user: result.rows[0] });
+  } catch (error) {
+    console.log("Session check error:", error);
+
+    res.status(500).json({
+      message: "Failed to check session",
+    });
+  }
+});
+
+app.get("/users/search", authenticateToken, async (req, res) => {
+  // Only an exact ID matches, so nobody can browse or guess through the user list.
+  const publicId = String(req.query.id || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+
+  if (publicId.length !== 8) {
     return res.status(400).json({
-      message: "Username is required",
+      message: "Enter the 8-character user ID",
     });
   }
 
   try {
     const result = await pool.query(
       `
-      SELECT id, username
+      SELECT id, username, public_id
       FROM users
-      WHERE username ILIKE $1
-      ORDER BY username
-      LIMIT 10
+      WHERE public_id = $1
       `,
-      [`%${username}%`],
+      [publicId],
     );
 
-    res.json(result.rows);
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        message: "No user found with that ID",
+      });
+    }
+
+    const user = result.rows[0];
+
+    res.json({
+      user,
+      isSelf: String(user.id) === String(req.user.userId),
+    });
   } catch (error) {
     console.log(error);
 
@@ -396,8 +484,13 @@ app.get("/conversations", authenticateToken, async (req, res) => {
           c.id AS conversation_id,
           u.id AS user_id,
           u.username,
+          u.public_id,
           c.keep_history,
-          c.created_at
+          c.created_at,
+          c.last_message_at,
+          c.last_message_text,
+          c.last_message_sender,
+          me.unread_count
         FROM conversations c
 
         JOIN conversation_members me
@@ -411,7 +504,7 @@ app.get("/conversations", authenticateToken, async (req, res) => {
         JOIN users u
           ON u.id = other.user_id
 
-        ORDER BY c.created_at DESC
+        ORDER BY COALESCE(c.last_message_at, c.created_at) DESC
         `,
       [currentUserId],
     );
@@ -426,6 +519,166 @@ app.get("/conversations", authenticateToken, async (req, res) => {
   }
 });
 
-server.listen(3000, () => {
-  console.log("Server is running on port 3000");
+app.post("/conversations/:id/read", authenticateToken, async (req, res) => {
+  const conversationId = Number(req.params.id);
+
+  if (!Number.isInteger(conversationId)) {
+    return res.status(400).json({
+      message: "Invalid conversation",
+    });
+  }
+
+  try {
+    await pool.query(
+      `
+        UPDATE conversation_members
+        SET unread_count = 0
+        WHERE conversation_id = $1
+          AND user_id = $2
+        `,
+      [conversationId, req.user.userId],
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.log("Mark read error:", error);
+
+    res.status(500).json({
+      message: "Failed to mark as read",
+    });
+  }
 });
+
+app.patch("/settings/history", authenticateToken, async (req, res) => {
+  const { keepHistory } = req.body;
+
+  if (typeof keepHistory !== "boolean") {
+    return res.status(400).json({
+      message: "keepHistory must be true or false",
+    });
+  }
+
+  try {
+    await pool.query(
+      `
+        UPDATE conversations
+        SET keep_history = $1
+        WHERE id IN (
+          SELECT conversation_id
+          FROM conversation_members
+          WHERE user_id = $2
+        )
+        `,
+      [keepHistory, req.user.userId],
+    );
+
+    if (!keepHistory) {
+      // Don't leave saved message text behind once saving is turned off.
+      await pool.query(
+        `
+        UPDATE conversations
+        SET last_message_text = NULL,
+            last_message_sender = NULL
+        WHERE id IN (
+          SELECT conversation_id
+          FROM conversation_members
+          WHERE user_id = $1
+        )
+        `,
+        [req.user.userId],
+      );
+    }
+
+    res.json({ keepHistory });
+  } catch (error) {
+    console.log("Settings error:", error);
+
+    res.status(500).json({
+      message: "Failed to update settings",
+    });
+  }
+});
+
+// Panic button: delete every saved message in all of the user's conversations.
+app.delete("/messages", authenticateToken, async (req, res) => {
+  try {
+    const conversations = await pool.query(
+      `
+        SELECT conversation_id
+        FROM conversation_members
+        WHERE user_id = $1
+        `,
+      [req.user.userId],
+    );
+
+    const ids = conversations.rows.map((row) => row.conversation_id);
+    const rooms = ids.map((id) => `conversation_${id}`);
+
+    let deleted = 0;
+
+    if (ids.length > 0) {
+      const result = await pool.query(
+        `DELETE FROM messages WHERE room = ANY($1::text[])`,
+        [rooms],
+      );
+
+      deleted = result.rowCount;
+
+      await pool.query(
+        `
+        UPDATE conversations
+        SET last_message_text = NULL,
+            last_message_sender = NULL
+        WHERE id = ANY($1::int[])
+        `,
+        [ids],
+      );
+
+      await pool.query(
+        `
+        UPDATE conversation_members
+        SET unread_count = 0
+        WHERE conversation_id = ANY($1::int[])
+        `,
+        [ids],
+      );
+
+      // Tell every member of those chats so open chats, previews and
+      // unread badges clear immediately.
+      const members = await pool.query(
+        `
+        SELECT conversation_id, user_id
+        FROM conversation_members
+        WHERE conversation_id = ANY($1::int[])
+        `,
+        [ids],
+      );
+
+      for (const member of members.rows) {
+        io.to(`user_${member.user_id}`).emit("history_cleared", {
+          room: `conversation_${member.conversation_id}`,
+        });
+      }
+    }
+
+    res.json({ deleted });
+  } catch (error) {
+    console.log("Panic delete error:", error);
+
+    res.status(500).json({
+      message: "Failed to delete chat history",
+    });
+  }
+});
+
+// Update the database first, then start accepting connections.
+runMigrations()
+  .then(() => {
+    server.listen(3000, () => {
+      console.log("Server is running on port 3000");
+    });
+  })
+  .catch((error) => {
+    console.error("Database setup failed:", error);
+    process.exit(1);
+  });

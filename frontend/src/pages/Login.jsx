@@ -28,8 +28,8 @@ function Login() {
       setMessage(result.message);
 
       if (response.ok) {
-        localStorage.setItem("token", result.token);
-        localStorage.setItem("user", JSON.stringify(result.user));
+        sessionStorage.setItem("token", result.token);
+        sessionStorage.setItem("user", JSON.stringify(result.user));
 
         navigate("/chat");
       }
