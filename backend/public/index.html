@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link href="" rel="stylesheet" />
+    <title></title>
+  </head>
+  <body>
+    <h1>Socket.IO Chat</h1>
+
+    <label>
+      <input type="checkbox" id="keep-history" checked />
+      Keep chat history
+    </label>
+
+    <h2 id="chat-with">Select a conversation</h2>
+
+    <div id="output"></div>
+
+    <h3>Chats</h3>
+
+    <div id="conversation-list"></div>
+
+    <input type="text" id="message" placeholder="Type a message" />
+    <button id="send">Send</button>
+
+    <div id="output"></div>
+
+    <h3>Find User</h3>
+
+    <input type="text" id="user-search" placeholder="Search username" />
+
+    <button id="search-user">Search</button>
+
+    <div id="search-results"></div>
+
+    <button id="logout">Logout</button>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/chat.js"></script>
+
+    <!-- <script>
+      const socket = io();
+    </script> -->
+  </body>
+</html>
