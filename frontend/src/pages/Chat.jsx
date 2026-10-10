@@ -73,7 +73,7 @@ function GearIcon() {
       className="h-6 w-6"
     >
       <circle cx="12" cy="12" r="3" />
-      <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" />
+      <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" />
     </svg>
   );
 }
@@ -95,6 +95,22 @@ function WarningIcon({ className = "h-4 w-4" }) {
   );
 }
 
+function CheckIcon({ className = "h-6 w-6" }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+    >
+      <path d="m5 12 4 4L19 6" />
+    </svg>
+  );
+}
+
 // K7M2QX9D -> K7M2-QX9D
 function formatId(id) {
   return id ? id.replace(/(.{4})(?=.)/g, "$1-") : "—";
@@ -106,6 +122,7 @@ let audioContext;
 function playPing() {
   try {
     audioContext ??= new (window.AudioContext || window.webkitAudioContext)();
+
     if (audioContext.state === "suspended") audioContext.resume();
 
     const now = audioContext.currentTime;
@@ -124,7 +141,7 @@ function playPing() {
     oscillator.start(now);
     oscillator.stop(now + 0.32);
   } catch {
-    // Sound is optional; ignore if the browser blocks it
+    // Sound is optional; ignore if the browser blocks it.
   }
 }
 
@@ -151,6 +168,17 @@ function Chat() {
   const [showPanic, setShowPanic] = useState(false);
   const [panicBusy, setPanicBusy] = useState(false);
   const [panicError, setPanicError] = useState("");
+
+  // Message request state
+  const [incomingRequests, setIncomingRequests] = useState([]);
+  const [showRequests, setShowRequests] = useState(false);
+  const [requestActionBusy, setRequestActionBusy] = useState({});
+
+  // New UI state
+  const [acceptedNotice, setAcceptedNotice] = useState(null);
+  const [requestSentTo, setRequestSentTo] = useState(null);
+  const [sendingRequest, setSendingRequest] = useState(false);
+
   const messagesEndRef = useRef(null);
   const navigate = useNavigate();
 
@@ -159,7 +187,7 @@ function Chat() {
     navigate("/", { replace: true });
   }
 
-  // Tracks when each conversation last had activity (sent or received)
+  // Tracks when each conversation last had activity.
   const [lastActivity, setLastActivity] = useState({});
   const activeConversationRef = useRef(null);
   const conversationsRef = useRef([]);
@@ -174,26 +202,28 @@ function Chat() {
 
   function bumpConversation(conversationId) {
     if (conversationId == null) return;
+
     setLastActivity((previous) => ({
       ...previous,
       [String(conversationId)]: Date.now(),
     }));
   }
 
-  // Most recent conversation first
+  // Most recent conversation first.
   const sortedConversations = useMemo(() => {
     function lastTime(conversation) {
       const local = lastActivity[String(conversation.conversation_id)] || 0;
       const serverValue =
         conversation.last_message_at ?? conversation.updated_at ?? null;
       const server = serverValue ? new Date(serverValue).getTime() : 0;
+
       return Math.max(local, server || 0);
     }
 
     return [...conversations].sort((a, b) => lastTime(b) - lastTime(a));
   }, [conversations, lastActivity]);
 
-  // "Save chat history" is on only when every conversation is saving
+  // Save chat history is on only when every conversation is saving.
   const historyEnabled =
     conversations.length === 0 || conversations.every((c) => c.keep_history);
 
@@ -210,29 +240,36 @@ function Chat() {
     });
   }
 
-  // Show the unread total in the browser tab title
+  // Show unread total in the browser tab title.
   useEffect(() => {
-    document.title = totalUnread > 0 ? `(${totalUnread}) Pyeonghwa` : "Pyeonghwa";
+    document.title =
+      totalUnread > 0 ? `(${totalUnread}) Pyeonghwa` : "Pyeonghwa";
   }, [totalUnread]);
 
-  // Clears the badge and tells the server this chat has been read
+  // Clear the badge and tell the server this chat has been read.
   function markRead(conversationId) {
     clearUnread(conversationId);
 
     fetch(`http://localhost:3000/conversations/${conversationId}/read`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${sessionStorage.getItem("token")}` },
+      headers: {
+        Authorization: `Bearer ${sessionStorage.getItem("token")}`,
+      },
     }).catch((error) => console.error("Mark read error:", error));
   }
 
-  // Coming back to the tab counts as reading the open chat
+  // Coming back to the tab counts as reading the open chat.
   useEffect(() => {
     function handleVisibility() {
       const active = activeConversationRef.current;
-      if (!document.hidden && active) markRead(active.conversation_id);
+
+      if (!document.hidden && active) {
+        markRead(active.conversation_id);
+      }
     }
 
     document.addEventListener("visibilitychange", handleVisibility);
+
     return () =>
       document.removeEventListener("visibilitychange", handleVisibility);
   }, []);
@@ -259,9 +296,12 @@ function Chat() {
         return;
       }
 
-      if (!response.ok) throw new Error("Failed to load conversations");
+      if (!response.ok) {
+        throw new Error("Failed to load conversations");
+      }
 
       const data = await response.json();
+
       setConversations(data);
 
       setUnread(
@@ -278,8 +318,45 @@ function Chat() {
     }
   }
 
+  /* Load incoming message requests */
+  async function loadIncomingRequests() {
+    try {
+      const response = await fetch(
+        "http://localhost:3000/message-requests/incoming",
+        {
+          headers: {
+            Authorization: `Bearer ${sessionStorage.getItem("token")}`,
+          },
+        },
+      );
+
+      if (response.status === 401) {
+        logout();
+        return;
+      }
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.message || "Failed to load message requests");
+      }
+
+      setIncomingRequests(
+        (Array.isArray(data) ? data : data.requests || []).map((request) => ({
+          ...request,
+          id: request.request_id ?? request.id,
+          username: request.sender_username ?? request.username,
+          public_id: request.sender_public_id ?? request.public_id,
+        })),
+      );
+    } catch (error) {
+      console.error("Incoming requests error:", error);
+    }
+  }
+
   useEffect(() => {
     loadConversations();
+    loadIncomingRequests();
   }, []);
 
   /* Join room when conversation changes */
@@ -287,6 +364,7 @@ function Chat() {
     if (!socket || !activeConversation) return;
 
     const room = `conversation_${activeConversation.conversation_id}`;
+
     socket.emit("join_room", room);
     console.log("Joining room:", room);
   }, [socket, activeConversation]);
@@ -300,6 +378,7 @@ function Chat() {
     }
 
     socket.on("chat_history", handleChatHistory);
+
     return () => socket.off("chat_history", handleChatHistory);
   }, [socket]);
 
@@ -312,7 +391,9 @@ function Chat() {
       return;
     }
 
-    const newSocket = io("http://localhost:3000", { auth: { token } });
+    const newSocket = io("http://localhost:3000", {
+      auth: { token },
+    });
 
     newSocket.on("connect", () => {
       console.log("Socket connected:", newSocket.id);
@@ -330,23 +411,60 @@ function Chat() {
     });
 
     setSocket(newSocket);
+
     return () => newSocket.disconnect();
   }, []);
+
+  /* Real-time message request updates */
+  useEffect(() => {
+    if (!socket) return;
+
+    function handleRequestReceived() {
+      loadIncomingRequests();
+    }
+
+    function handleRequestAccepted(data = {}) {
+      // Refresh the conversation list for both users.
+      loadConversations();
+
+      // Only the original requester should see this notification.
+      if (Number(currentUser?.id) !== Number(data.requesterId)) {
+        return;
+      }
+
+      setAcceptedNotice({
+        username: data.username || "Someone",
+        id: Date.now(),
+      });
+    }
+
+    function handleRequestRejected() {
+      console.log("Your message request was rejected.");
+    }
+
+    socket.on("message_request_received", handleRequestReceived);
+    socket.on("message_request_accepted", handleRequestAccepted);
+    socket.on("message_request_rejected", handleRequestRejected);
+
+    return () => {
+      socket.off("message_request_received", handleRequestReceived);
+      socket.off("message_request_accepted", handleRequestAccepted);
+      socket.off("message_request_rejected", handleRequestRejected);
+    };
+  }, [socket]);
 
   /* Live messages */
   useEffect(() => {
     if (!socket) return;
 
     function handleNewMessage(message) {
-      // Use the room from the server if it sends one, otherwise assume
-      // the message belongs to the conversation that is currently open.
       const conversationId = message.room
         ? String(message.room).replace("conversation_", "")
         : activeConversationRef.current?.conversation_id;
 
       bumpConversation(conversationId);
 
-      // Ignore messages that belong to a different chat than the open one.
+      // Ignore messages belonging to a different chat.
       if (
         String(conversationId) !==
         String(activeConversationRef.current?.conversation_id)
@@ -365,10 +483,11 @@ function Chat() {
     }
 
     socket.on("chat_message", handleNewMessage);
+
     return () => socket.off("chat_message", handleNewMessage);
   }, [socket]);
 
-  /* Activity in any conversation (even one that is not open) */
+  /* Activity in any conversation */
   useEffect(() => {
     if (!socket) return;
 
@@ -383,8 +502,6 @@ function Chat() {
         [id]: { text: message, mine },
       }));
 
-      // Notify when the message is from someone else and the chat isn't
-      // being looked at right now.
       const isBeingViewed =
         String(activeConversationRef.current?.conversation_id) === id &&
         !document.hidden;
@@ -394,23 +511,25 @@ function Chat() {
           ...previous,
           [id]: (previous[id] || 0) + 1,
         }));
+
         playPing();
       } else if (!mine) {
         markRead(id);
       }
 
-      // Someone started a new chat with me: reload the list to include it.
       const known = conversationsRef.current.some(
         (c) => String(c.conversation_id) === String(conversationId),
       );
+
       if (!known) loadConversations();
     }
 
     socket.on("conversation_activity", handleActivity);
+
     return () => socket.off("conversation_activity", handleActivity);
   }, [socket]);
 
-  /* Someone used the panic button: clear the open chat */
+  /* Someone used the panic button */
   useEffect(() => {
     if (!socket) return;
 
@@ -421,12 +540,14 @@ function Chat() {
       clearUnread(id);
 
       const active = activeConversationRef.current;
+
       if (active && room === `conversation_${active.conversation_id}`) {
         setMessages([]);
       }
     }
 
     socket.on("history_cleared", handleCleared);
+
     return () => socket.off("history_cleared", handleCleared);
   }, [socket]);
 
@@ -455,10 +576,13 @@ function Chat() {
     setSearchId("");
     setSearchResult(null);
     setSearchStatus("idle");
+    setRequestSentTo(null);
+    setSendingRequest(false);
   }
 
   async function searchUser(rawId) {
     const id = rawId.toUpperCase().replace(/[^A-Z0-9]/g, "");
+
     if (id.length !== 8) return;
 
     setSearchStatus("loading");
@@ -484,13 +608,131 @@ function Chat() {
         return;
       }
 
-      if (!response.ok) throw new Error("Search failed");
+      if (!response.ok) {
+        throw new Error("Search failed");
+      }
 
       setSearchResult(await response.json());
       setSearchStatus("found");
     } catch (error) {
       console.error("User search error:", error);
       setSearchStatus("error");
+    }
+  }
+
+  /* Send a message request */
+  async function sendMessageRequest(targetUserId) {
+    if (sendingRequest) return;
+
+    setSendingRequest(true);
+
+    try {
+      const response = await fetch("http://localhost:3000/message-requests", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${sessionStorage.getItem("token")}`,
+        },
+        body: JSON.stringify({ targetUserId }),
+      });
+
+      if (response.status === 401 || response.status === 403) {
+        logout();
+        return;
+      }
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        console.error("Send message request failed:", data.message);
+        setSearchStatus("sendError");
+        return;
+      }
+
+      setRequestSentTo({
+        username: searchResult?.user?.username || "your new contact",
+        public_id: searchResult?.user?.public_id,
+      });
+
+      setSearchStatus("sent");
+    } catch (error) {
+      console.error("Send message request error:", error);
+      setSearchStatus("sendError");
+    } finally {
+      setSendingRequest(false);
+    }
+  }
+
+  /* Accept or reject an incoming request */
+  async function respondToRequest(requestId, action) {
+    setRequestActionBusy((previous) => ({
+      ...previous,
+      [requestId]: true,
+    }));
+
+    try {
+      const response = await fetch(
+        `http://localhost:3000/message-requests/${requestId}/respond`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${sessionStorage.getItem("token")}`,
+          },
+          body: JSON.stringify({ action }),
+        },
+      );
+
+      if (response.status === 401) {
+        logout();
+        return;
+      }
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.message || "Could not respond to request");
+      }
+
+      // Remove the request from the pending list.
+      setIncomingRequests((previous) =>
+        previous.filter((request) => String(request.id) !== String(requestId)),
+      );
+
+      if (action === "accept") {
+        const list = await loadConversations();
+
+        const conversationId =
+          data.conversation?.conversationId ??
+          data.conversation?.conversation_id ??
+          data.conversationId;
+
+        const conversation = list?.find(
+          (item) => String(item.conversation_id) === String(conversationId),
+        );
+
+        if (conversation) {
+          setShowRequests(false);
+          openConversation(conversation);
+        } else {
+          console.warn(
+            "Request accepted, but the conversation was not found in the refreshed list.",
+          );
+
+          alert(
+            "Request accepted! If the conversation doesn't appear yet, refresh the page.",
+          );
+        }
+      }
+    } catch (error) {
+      console.error("Respond to request error:", error);
+      alert(error.message || "Could not respond to request");
+      loadIncomingRequests();
+    } finally {
+      setRequestActionBusy((previous) => ({
+        ...previous,
+        [requestId]: false,
+      }));
     }
   }
 
@@ -503,10 +745,13 @@ function Chat() {
     setSearchId(cleaned);
     setSearchResult(null);
     setSearchStatus("idle");
+    setRequestSentTo(null);
 
     if (cleaned.length === 8) searchUser(cleaned);
   }
 
+  // Kept for compatibility with existing conversations.
+  // New conversations must begin with an accepted request.
   async function startChat(user) {
     setStartingChat(true);
 
@@ -520,11 +765,19 @@ function Chat() {
         body: JSON.stringify({ targetUserId: user.id }),
       });
 
-      if (!response.ok) throw new Error("Could not start the chat");
+      const data = await response.json();
 
-      const { conversationId } = await response.json();
+      if (!response.ok) {
+        throw new Error(
+          data.message || "A message request must be accepted first.",
+        );
+      }
+
+      const conversationId =
+        data.conversationId ?? data.conversation?.conversationId;
 
       const list = await loadConversations();
+
       const conversation = list?.find(
         (c) => String(c.conversation_id) === String(conversationId),
       );
@@ -556,7 +809,9 @@ function Chat() {
         body: JSON.stringify({ keepHistory: next }),
       });
 
-      if (!response.ok) throw new Error("Request failed");
+      if (!response.ok) {
+        throw new Error("Request failed");
+      }
 
       setConversations((previous) =>
         previous.map((c) => ({
@@ -582,10 +837,14 @@ function Chat() {
     try {
       const response = await fetch("http://localhost:3000/messages", {
         method: "DELETE",
-        headers: { Authorization: `Bearer ${sessionStorage.getItem("token")}` },
+        headers: {
+          Authorization: `Bearer ${sessionStorage.getItem("token")}`,
+        },
       });
 
-      if (!response.ok) throw new Error("Request failed");
+      if (!response.ok) {
+        throw new Error("Request failed");
+      }
 
       setMessages([]);
       setShowPanic(false);
@@ -612,6 +871,7 @@ function Chat() {
     if (!socket || !activeConversation) return;
 
     const message = messageInput.trim();
+
     if (!message) return;
 
     const room = `conversation_${activeConversation.conversation_id}`;
@@ -624,9 +884,45 @@ function Chat() {
 
   return (
     <div className="flex h-dvh w-full overflow-hidden bg-slate-950 text-white">
-      {/* ================= Conversation list =================
-          Mobile: full page (hidden while a chat is open)
-          Desktop: always-visible sidebar */}
+      {/* ================= Accepted request notification ================= */}
+      {acceptedNotice && (
+        <div className="fixed left-1/2 top-5 z-100 w-[calc(100%-2rem)] max-w-md -translate-x-1/2 animate-in fade-in slide-in-from-top-3 duration-300">
+          <div className="flex items-start gap-3 rounded-2xl border border-emerald-400/30 bg-slate-900/95 p-4 shadow-2xl shadow-emerald-950/40 backdrop-blur-xl">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-emerald-400/15 text-emerald-400">
+              <CheckIcon className="h-6 w-6" />
+            </div>
+
+            <div className="min-w-0 flex-1">
+              <p className="font-bold text-white">Message request accepted!</p>
+
+              <p className="mt-1 text-sm leading-5 text-slate-300">
+                {acceptedNotice.username} accepted your message request! You can
+                start chatting now.
+              </p>
+
+              <button
+                onClick={() => {
+                  loadConversations();
+                  setAcceptedNotice(null);
+                }}
+                className="mt-3 rounded-lg bg-emerald-400 px-4 py-2 text-sm font-bold text-slate-950 transition hover:bg-emerald-300"
+              >
+                Got it
+              </button>
+            </div>
+
+            <button
+              onClick={() => setAcceptedNotice(null)}
+              className="rounded-lg px-2 py-1 text-slate-400 transition hover:bg-white/10 hover:text-white"
+              aria-label="Dismiss notification"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ================= Conversation list ================= */}
       <aside
         className={`${
           activeConversation ? "hidden" : "flex"
@@ -672,7 +968,11 @@ function Chat() {
           }
           className="mx-5 mt-4 flex items-center gap-3 rounded-xl bg-slate-900 px-3 py-2.5 text-left hover:bg-slate-800"
         >
-          <Avatar name={currentUser?.username} size="h-10 w-10" text="text-sm" />
+          <Avatar
+            name={currentUser?.username}
+            size="h-10 w-10"
+            text="text-sm"
+          />
 
           <div className="min-w-0 flex-1">
             <p className="truncate text-sm font-semibold">
@@ -684,11 +984,28 @@ function Chat() {
           </div>
         </button>
 
+        {/* Message Requests */}
+        <button
+          onClick={() => {
+            setShowRequests(true);
+            loadIncomingRequests();
+          }}
+          className="mx-5 mt-3 flex items-center justify-between rounded-xl bg-slate-900 px-4 py-3 text-left hover:bg-slate-800"
+        >
+          <span className="font-medium">Message Requests</span>
+
+          {incomingRequests.length > 0 && (
+            <span className="flex h-6 min-w-6 items-center justify-center rounded-full bg-teal-500 px-2 text-xs font-bold text-slate-950">
+              {incomingRequests.length > 99 ? "99+" : incomingRequests.length}
+            </span>
+          )}
+        </button>
+
         <h2 className="px-5 pb-2 pt-6 text-sm font-semibold text-slate-400">
           Messages
         </h2>
 
-        {/* Vertical list */}
+        {/* Conversation list */}
         <div className="flex-1 overflow-y-auto">
           {conversations.length === 0 ? (
             <p className="px-5 py-4 text-sm text-slate-500">
@@ -697,10 +1014,12 @@ function Chat() {
           ) : (
             sortedConversations.map((conversation) => {
               const isActive =
-                activeConversation?.conversation_id ===
-                conversation.conversation_id;
+                String(activeConversation?.conversation_id) ===
+                String(conversation.conversation_id);
+
               const id = String(conversation.conversation_id);
               const count = unread[id] || 0;
+
               const preview =
                 id in previews
                   ? previews[id]
@@ -758,16 +1077,13 @@ function Chat() {
         </div>
       </aside>
 
-      {/* ================= Chat panel =================
-          Mobile: full page (only when a chat is open)
-          Desktop: always visible */}
+      {/* ================= Chat panel ================= */}
       <main
         className={`${
           activeConversation ? "flex" : "hidden"
         } min-h-0 min-w-0 flex-1 flex-col md:flex`}
       >
         {!activeConversation ? (
-          /* Desktop empty state */
           <div className="flex h-full flex-col items-center justify-center px-6 text-center">
             <div className="mb-4 text-5xl">💬</div>
             <h2 className="mb-2 text-xl font-semibold">Your space to chat</h2>
@@ -885,6 +1201,7 @@ function Chat() {
                   );
                 })
               )}
+
               <div ref={messagesEndRef} />
             </section>
 
@@ -984,6 +1301,87 @@ function Chat() {
         </div>
       )}
 
+      {/* ================= Message Requests modal ================= */}
+      {showRequests && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 md:items-center md:p-4"
+          onClick={() => setShowRequests(false)}
+        >
+          <div
+            className="w-full rounded-t-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl md:max-w-md md:rounded-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="mb-5 flex items-center justify-between">
+              <div>
+                <h2 className="text-xl font-bold">Message Requests</h2>
+                <p className="mt-1 text-sm text-slate-400">
+                  Accept a request to start a conversation.
+                </p>
+              </div>
+
+              <button
+                onClick={() => setShowRequests(false)}
+                className="rounded-lg px-3 py-1 text-slate-400 hover:bg-slate-800 hover:text-white"
+                aria-label="Close message requests"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="max-h-[60dvh] space-y-3 overflow-y-auto">
+              {incomingRequests.length === 0 ? (
+                <p className="py-8 text-center text-sm text-slate-400">
+                  No pending message requests.
+                </p>
+              ) : (
+                incomingRequests.map((request) => (
+                  <div
+                    key={request.id}
+                    className="flex items-center gap-3 rounded-xl bg-slate-950 p-3"
+                  >
+                    <Avatar
+                      name={request.username || "?"}
+                      size="h-11 w-11"
+                      text="text-sm"
+                    />
+
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate font-semibold">
+                        {request.username || "Unknown user"}
+                      </p>
+
+                      <p className="truncate font-mono text-xs text-slate-400">
+                        {formatId(request.public_id)}
+                      </p>
+                    </div>
+
+                    <div className="flex shrink-0 flex-col gap-2">
+                      <button
+                        onClick={() => respondToRequest(request.id, "accept")}
+                        disabled={Boolean(requestActionBusy[request.id])}
+                        className="rounded-lg bg-teal-600 px-3 py-1.5 text-sm font-semibold hover:bg-teal-500 disabled:opacity-50"
+                      >
+                        {requestActionBusy[request.id]
+                          ? "Please wait..."
+                          : "Accept"}
+                      </button>
+
+                      <button
+                        onClick={() => respondToRequest(request.id, "reject")}
+                        disabled={Boolean(requestActionBusy[request.id])}
+                        className="rounded-lg bg-slate-800 px-3 py-1.5 text-sm font-semibold text-slate-300 hover:bg-slate-700 disabled:opacity-50"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ================= Panic modal ================= */}
       {showPanic && (
         <div
@@ -998,6 +1396,7 @@ function Chat() {
               <div className="flex h-10 w-10 items-center justify-center rounded-full bg-red-600/20 text-red-400">
                 <WarningIcon className="h-5 w-5" />
               </div>
+
               <h2 className="text-xl font-bold">Delete all chat history?</h2>
             </div>
 
@@ -1053,8 +1452,14 @@ function Chat() {
             </div>
 
             <div className="flex flex-col items-center text-center">
-              <Avatar name={profile.username} size="h-24 w-24" text="text-4xl" />
+              <Avatar
+                name={profile.username}
+                size="h-24 w-24"
+                text="text-4xl"
+              />
+
               <h2 className="mt-4 text-xl font-bold">{profile.username}</h2>
+
               {profile.isMe && (
                 <p className="text-sm text-slate-400">This is you</p>
               )}
@@ -1091,88 +1496,231 @@ function Chat() {
       {/* ================= Search modal ================= */}
       {showUserSearch && (
         <div
-          className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 md:items-center md:p-4"
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/70 backdrop-blur-sm md:items-center md:p-4"
           onClick={closeSearch}
         >
           <div
-            className="w-full rounded-t-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl md:max-w-md md:rounded-2xl"
+            className="w-full overflow-hidden rounded-t-3xl border border-slate-700 bg-slate-900 shadow-2xl md:max-w-md md:rounded-3xl"
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="mb-5 flex items-center justify-between">
-              <h2 className="text-xl font-bold">Find someone</h2>
+            {/* Search modal header */}
+            <div className="flex items-center justify-between border-b border-slate-800 px-6 py-5">
+              <div>
+                <h2 className="text-xl font-bold">Find someone</h2>
+                <p className="mt-1 text-sm text-slate-400">
+                  Connect with people using their ID.
+                </p>
+              </div>
 
               <button
                 onClick={closeSearch}
-                className="rounded-lg px-3 py-1 text-slate-400 hover:bg-slate-800 hover:text-white"
+                className="rounded-xl bg-slate-800 px-3 py-2 text-slate-400 transition hover:bg-slate-700 hover:text-white"
                 aria-label="Close search popup"
               >
                 ✕
               </button>
             </div>
 
-            <input
-              type="text"
-              value={searchId}
-              onChange={(event) => handleSearchChange(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") searchUser(searchId);
-              }}
-              placeholder="Enter their 8-character ID"
-              autoFocus
-              autoCapitalize="characters"
-              autoComplete="off"
-              spellCheck={false}
-              className="w-full rounded-xl border border-slate-700 bg-slate-950 p-3 font-mono text-base uppercase tracking-widest outline-none placeholder:font-sans placeholder:normal-case placeholder:tracking-normal focus:border-teal-500"
-            />
+            <div className="p-6">
+              {/* Successful request screen */}
+              {searchStatus === "sent" && requestSentTo ? (
+                <div className="py-3 text-center">
+                  <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full border border-emerald-400/30 bg-emerald-400/10">
+                    <CheckIcon className="h-10 w-10 text-emerald-400" />
+                  </div>
 
-            <div className="mt-4 min-h-20">
-              {searchStatus === "idle" && (
-                <p className="text-sm text-slate-400">
-                  Ask them for their ID. It's on their profile.
-                </p>
-              )}
+                  <h3 className="mt-5 text-2xl font-bold text-white">
+                    Request sent!
+                  </h3>
 
-              {searchStatus === "loading" && (
-                <p className="text-sm text-slate-400">Searching...</p>
-              )}
+                  <p className="mx-auto mt-2 max-w-xs text-sm leading-6 text-slate-400">
+                    Your message request has been sent to{" "}
+                    <span className="font-semibold text-white">
+                      {requestSentTo.username}
+                    </span>
+                    . Once they accept, you can start chatting.
+                  </p>
 
-              {searchStatus === "notfound" && (
-                <p className="text-sm text-red-400">
-                  No one has that ID. Check it and try again.
-                </p>
-              )}
+                  <div className="mx-auto mt-6 flex max-w-xs items-center gap-3 rounded-2xl border border-slate-700 bg-slate-950 p-4 text-left">
+                    <Avatar name={requestSentTo.username} size="h-12 w-12" />
 
-              {searchStatus === "error" && (
-                <p className="text-sm text-red-400">
-                  Something went wrong. Please try again.
-                </p>
-              )}
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate font-semibold text-white">
+                        {requestSentTo.username}
+                      </p>
+                      <p className="font-mono text-xs text-slate-400">
+                        {formatId(requestSentTo.public_id)}
+                      </p>
+                    </div>
 
-              {searchStatus === "found" && searchResult && (
-                <div className="flex items-center gap-3 rounded-xl bg-slate-950 p-3">
-                  <Avatar name={searchResult.user.username} />
+                    <span className="shrink-0 rounded-full border border-amber-400/20 bg-amber-400/10 px-2.5 py-1 text-xs font-semibold text-amber-300">
+                      Pending
+                    </span>
+                  </div>
 
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate font-semibold">
-                      {searchResult.user.username}
+                  <div className="mt-6 rounded-xl bg-slate-800/60 p-3 text-left">
+                    <p className="text-sm font-medium text-slate-200">
+                      What's next?
                     </p>
-                    <p className="font-mono text-xs tracking-wider text-slate-400">
-                      {formatId(searchResult.user.public_id)}
+                    <p className="mt-1 text-xs leading-5 text-slate-400">
+                      They'll find your request in their Message Requests panel.
+                      You'll be able to chat once they accept it.
                     </p>
                   </div>
 
-                  {searchResult.isSelf ? (
-                    <span className="text-sm text-slate-400">That's you</span>
-                  ) : (
-                    <button
-                      onClick={() => startChat(searchResult.user)}
-                      disabled={startingChat}
-                      className="rounded-lg bg-teal-600 px-4 py-2 text-sm font-semibold hover:bg-teal-500 disabled:opacity-50"
-                    >
-                      {startingChat ? "Opening..." : "Message"}
-                    </button>
-                  )}
+                  <button
+                    onClick={closeSearch}
+                    className="mt-6 w-full rounded-xl bg-teal-500 py-3 font-bold text-slate-950 transition hover:bg-teal-400"
+                  >
+                    Done
+                  </button>
                 </div>
+              ) : (
+                <>
+                  {/* User ID input */}
+                  <label
+                    htmlFor="search-user-id"
+                    className="mb-2 block text-sm font-semibold text-slate-300"
+                  >
+                    User ID
+                  </label>
+
+                  <input
+                    id="search-user-id"
+                    type="text"
+                    value={searchId}
+                    onChange={(event) => handleSearchChange(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") searchUser(searchId);
+                    }}
+                    placeholder="Enter their 8-character ID"
+                    autoFocus
+                    autoCapitalize="characters"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="w-full rounded-xl border border-slate-700 bg-slate-950 p-3.5 font-mono text-base uppercase tracking-widest outline-none transition placeholder:font-sans placeholder:normal-case placeholder:tracking-normal focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20"
+                  />
+
+                  <p className="mt-2 text-xs text-slate-500">
+                    Ask them for their ID. They can find it on their profile.
+                  </p>
+
+                  <div className="mt-5">
+                    {searchStatus === "idle" && (
+                      <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                        <p className="text-sm text-slate-400">
+                          Enter the ID to find the person you want to connect
+                          with.
+                        </p>
+                      </div>
+                    )}
+
+                    {searchStatus === "loading" && (
+                      <div className="flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-950 p-4">
+                        <span className="h-5 w-5 animate-spin rounded-full border-2 border-slate-700 border-t-teal-400" />
+                        <p className="text-sm text-slate-300">
+                          Searching for user...
+                        </p>
+                      </div>
+                    )}
+
+                    {searchStatus === "notfound" && (
+                      <div className="rounded-xl border border-red-400/20 bg-red-400/5 p-4">
+                        <p className="font-semibold text-red-300">
+                          User not found
+                        </p>
+                        <p className="mt-1 text-sm text-slate-400">
+                          We couldn't find that ID. Double-check it and try
+                          again.
+                        </p>
+                      </div>
+                    )}
+
+                    {(searchStatus === "error" ||
+                      searchStatus === "sendError") && (
+                      <div className="rounded-xl border border-red-400/20 bg-red-400/5 p-4">
+                        <p className="font-semibold text-red-300">
+                          {searchStatus === "sendError"
+                            ? "Couldn't send request"
+                            : "Something went wrong"}
+                        </p>
+                        <p className="mt-1 text-sm text-slate-400">
+                          {searchStatus === "sendError"
+                            ? "They may already have a pending request or an existing conversation. Please try again later."
+                            : "Please try again."}
+                        </p>
+                      </div>
+                    )}
+
+                    {searchStatus === "found" && searchResult && (
+                      <div className="rounded-2xl border border-teal-500/20 bg-slate-950 p-4">
+                        <div className="mb-4 flex items-center gap-2">
+                          <span className="flex h-5 w-5 items-center justify-center rounded-full bg-emerald-400/15 text-emerald-400">
+                            <CheckIcon className="h-3.5 w-3.5" />
+                          </span>
+                          <span className="text-sm font-semibold text-emerald-300">
+                            User found
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-3">
+                          <Avatar
+                            name={searchResult.user.username}
+                            size="h-14 w-14"
+                            text="text-lg"
+                          />
+
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-base font-bold text-white">
+                              {searchResult.user.username}
+                            </p>
+                            <p className="mt-1 font-mono text-xs tracking-wider text-slate-400">
+                              {formatId(searchResult.user.public_id)}
+                            </p>
+                          </div>
+
+                          <span className="rounded-full bg-emerald-400/10 px-2.5 py-1 text-xs font-semibold text-emerald-300">
+                            Found
+                          </span>
+                        </div>
+
+                        {searchResult.isSelf ? (
+                          <p className="mt-4 rounded-lg bg-slate-900 p-3 text-sm text-slate-400">
+                            This is your own account. Search for someone else's
+                            ID to connect.
+                          </p>
+                        ) : (
+                          <>
+                            <p className="mt-4 text-sm leading-5 text-slate-400">
+                              Send a message request to connect. You'll be able
+                              to chat after they accept.
+                            </p>
+
+                            <button
+                              onClick={() =>
+                                sendMessageRequest(searchResult.user.id)
+                              }
+                              disabled={sendingRequest}
+                              className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-teal-500 px-4 py-3 font-bold text-slate-950 transition hover:bg-teal-400 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              {sendingRequest ? (
+                                <>
+                                  <span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-950/30 border-t-slate-950" />
+                                  Sending request...
+                                </>
+                              ) : (
+                                <>
+                                  <PlusIcon />
+                                  Send message request
+                                </>
+                              )}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </>
               )}
             </div>
           </div>

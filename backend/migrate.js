@@ -109,6 +109,26 @@ async function runMigrations() {
     await client.query(
       `CREATE UNIQUE INDEX IF NOT EXISTS users_public_id_key ON users (public_id)`,
     );
+    
+    // 4. Message requests between users
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS message_requests (
+        id SERIAL PRIMARY KEY,
+        sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        receiver_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending', 'accepted', 'rejected')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        responded_at TIMESTAMPTZ,
+        CHECK (sender_id <> receiver_id)
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS message_requests_receiver_status_idx
+      ON message_requests (receiver_id, status)
+    `);
+
 
     await client.query("COMMIT");
     console.log("Database is up to date");

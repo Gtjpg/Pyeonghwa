@@ -400,6 +400,326 @@ app.get("/users/search", authenticateToken, async (req, res) => {
   }
 });
 
+app.post("/message-requests", authenticateToken, async (req, res) => {
+  const senderId = req.user.userId;
+  const { targetUserId } = req.body;
+  const receiverId = Number(targetUserId);
+
+  if (!Number.isInteger(receiverId) || receiverId <= 0) {
+    return res.status(400).json({
+      message: "A valid target user is required",
+    });
+  }
+
+  if (senderId === receiverId) {
+    return res.status(400).json({
+      message: "You cannot send a request to yourself",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // Make sure the target user exists.
+    const target = await client.query(`SELECT id FROM users WHERE id = $1`, [
+      receiverId,
+    ]);
+
+    if (target.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
+    // If these users already have a conversation, don't create a request.
+    const existingConversation = await client.query(
+      `
+      SELECT cm.conversation_id
+      FROM conversation_members cm
+      WHERE cm.user_id IN ($1, $2)
+      GROUP BY cm.conversation_id
+      HAVING COUNT(DISTINCT cm.user_id) = 2
+        AND (
+          SELECT COUNT(*)
+          FROM conversation_members cm2
+          WHERE cm2.conversation_id = cm.conversation_id
+        ) = 2
+      LIMIT 1
+      `,
+      [senderId, receiverId],
+    );
+
+    if (existingConversation.rows.length > 0) {
+      await client.query("COMMIT");
+      return res.status(409).json({
+        message: "You already have a conversation with this user",
+      });
+    }
+
+    // Reuse an existing pending request in either direction.
+    const existingRequest = await client.query(
+      `
+      SELECT id, sender_id, receiver_id, status
+      FROM message_requests
+      WHERE status = 'pending'
+        AND (
+          (sender_id = $1 AND receiver_id = $2)
+          OR
+          (sender_id = $2 AND receiver_id = $1)
+        )
+      LIMIT 1
+      `,
+      [senderId, receiverId],
+    );
+
+    if (existingRequest.rows.length > 0) {
+      await client.query("COMMIT");
+      return res.status(409).json({
+        message: "A pending request already exists between these users",
+      });
+    }
+
+    const result = await client.query(
+      `
+      INSERT INTO message_requests (sender_id, receiver_id)
+      VALUES ($1, $2)
+      RETURNING id, sender_id, receiver_id, status, created_at
+      `,
+      [senderId, receiverId],
+    );
+
+    await client.query("COMMIT");
+
+    const request = result.rows[0];
+
+    // Notify the recipient if they are currently connected.
+    io.to(`user_${receiverId}`).emit("message_request_received", {
+      requestId: request.id,
+      senderId,
+    });
+
+    return res.status(201).json({
+      message: "Message request sent",
+      request,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Send message request error:", error);
+
+    return res.status(500).json({
+      message: "Failed to send message request",
+    });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/message-requests/incoming", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        mr.id AS request_id,
+        mr.sender_id,
+        u.username AS sender_username,
+        u.public_id AS sender_public_id,
+        mr.created_at
+      FROM message_requests mr
+      JOIN users u ON u.id = mr.sender_id
+      WHERE mr.receiver_id = $1
+        AND mr.status = 'pending'
+      ORDER BY mr.created_at DESC
+      `,
+      [req.user.userId],
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Incoming requests error:", error);
+
+    res.status(500).json({
+      message: "Failed to load incoming requests",
+    });
+  }
+});
+
+app.post(
+  "/message-requests/:id/respond",
+  authenticateToken,
+  async (req, res) => {
+    const requestId = Number(req.params.id);
+    const { action } = req.body;
+    const receiverId = req.user.userId;
+
+    if (!Number.isInteger(requestId) || requestId <= 0) {
+      return res.status(400).json({
+        message: "Invalid request ID",
+      });
+    }
+
+    if (!["accept", "reject"].includes(action)) {
+      return res.status(400).json({
+        message: "Action must be accept or reject",
+      });
+    }
+
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      // Lock the request so it cannot be accepted or rejected twice.
+      const requestResult = await client.query(
+        `
+        SELECT id, sender_id, receiver_id, status
+        FROM message_requests
+        WHERE id = $1
+        FOR UPDATE
+        `,
+        [requestId],
+      );
+
+      if (requestResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          message: "Message request not found",
+        });
+      }
+
+      const request = requestResult.rows[0];
+
+      // Only the recipient can respond.
+      if (request.receiver_id !== receiverId) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          message: "You cannot respond to this request",
+        });
+      }
+
+      if (request.status !== "pending") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          message: "This request has already been handled",
+        });
+      }
+
+      if (action === "reject") {
+        await client.query(
+          `
+          UPDATE message_requests
+          SET status = 'rejected',
+              responded_at = NOW()
+          WHERE id = $1
+          `,
+          [requestId],
+        );
+
+        await client.query("COMMIT");
+
+        io.to(`user_${request.sender_id}`).emit("message_request_rejected", {
+          requestId,
+        });
+
+        return res.json({
+          message: "Message request rejected",
+        });
+      }
+
+      // Check whether a conversation already exists between these users.
+      const existingConversation = await client.query(
+        `
+        SELECT cm.conversation_id
+        FROM conversation_members cm
+        WHERE cm.user_id IN ($1, $2)
+        GROUP BY cm.conversation_id
+        HAVING COUNT(DISTINCT cm.user_id) = 2
+          AND (
+            SELECT COUNT(*)
+            FROM conversation_members cm2
+            WHERE cm2.conversation_id = cm.conversation_id
+          ) = 2
+        LIMIT 1
+        `,
+        [request.sender_id, request.receiver_id],
+      );
+
+      let conversationId;
+
+      if (existingConversation.rows.length > 0) {
+        conversationId = existingConversation.rows[0].conversation_id;
+      } else {
+        const conversationResult = await client.query(
+          `INSERT INTO conversations DEFAULT VALUES RETURNING id`,
+        );
+
+        conversationId = conversationResult.rows[0].id;
+
+        await client.query(
+          `
+          INSERT INTO conversation_members (conversation_id, user_id)
+          VALUES ($1, $2), ($1, $3)
+          `,
+          [conversationId, request.sender_id, request.receiver_id],
+        );
+      }
+
+      await client.query(
+        `
+        UPDATE message_requests
+        SET status = 'accepted',
+            responded_at = NOW()
+        WHERE id = $1
+        `,
+        [requestId],
+      );
+
+      await client.query("COMMIT");
+
+      const conversation = {
+        conversationId,
+        room: `conversation_${conversationId}`,
+      };
+
+      // Notify the requester and recipient so their interfaces can refresh.
+
+      // Get the username of the user who accepted the request.
+      const accepterResult = await client.query(
+        `SELECT username FROM users WHERE id = $1`,
+        [receiverId],
+      );
+
+      const accepterUsername = accepterResult.rows[0]?.username || "Someone";
+
+      // Notify both users so their interfaces can refresh.
+      for (const userId of [request.sender_id, request.receiver_id]) {
+        io.to(`user_${userId}`).emit("message_request_accepted", {
+          requestId,
+          conversation,
+          username: accepterUsername,
+          requesterId: request.sender_id,
+        });
+      }
+
+      return res.json({
+        message: "Message request accepted",
+        ...conversation,
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      console.error("Respond to message request error:", error);
+
+      return res.status(500).json({
+        message: "Failed to respond to message request",
+      });
+    } finally {
+      client.release();
+    }
+  },
+);
+
 app.post("/conversations", authenticateToken, async (req, res) => {
   const currentUserId = req.user.userId;
   const { targetUserId } = req.body;
@@ -450,20 +770,9 @@ app.post("/conversations", authenticateToken, async (req, res) => {
         `,
     );
 
-    const conversationId = conversation.rows[0].id;
-
-    await pool.query(
-      `
-        INSERT INTO conversation_members
-        (conversation_id, user_id)
-        VALUES ($1, $2), ($1, $3)
-        `,
-      [conversationId, currentUserId, targetUserId],
-    );
-
-    res.status(201).json({
-      conversationId,
-      room: `conversation_${conversationId}`,
+    return res.status(403).json({
+      message:
+        "A message request must be accepted before starting a new conversation",
     });
   } catch (error) {
     console.log("Conversation error:", error);
