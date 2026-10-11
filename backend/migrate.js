@@ -110,6 +110,31 @@ async function runMigrations() {
       `CREATE UNIQUE INDEX IF NOT EXISTS users_public_id_key ON users (public_id)`,
     );
     
+    
+    
+    // 4. Image messages
+    await client.query(`
+      ALTER TABLE messages
+        ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'text',
+        ADD COLUMN IF NOT EXISTS image_url TEXT
+    `);
+
+    const imageConstraint = await client.query(`
+      SELECT 1
+      FROM pg_constraint
+      WHERE conname = 'messages_message_type_check'
+        AND conrelid = 'messages'::regclass
+    `);
+
+    if (imageConstraint.rows.length === 0) {
+      await client.query(`
+        ALTER TABLE messages
+        ADD CONSTRAINT messages_message_type_check
+        CHECK (message_type IN ('text', 'image'))
+      `);
+    }
+
+
     // 4. Message requests between users
     await client.query(`
       CREATE TABLE IF NOT EXISTS message_requests (
