@@ -410,7 +410,7 @@ function Chat() {
     return () => socket.off("conversation_activity", handleActivity);
   }, [socket]);
 
-  /* Someone used the panic button: clear the open chat */
+  /* Someone used the panic button clear the open chat */
   useEffect(() => {
     if (!socket) return;
 
