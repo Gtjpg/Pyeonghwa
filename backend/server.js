@@ -1,4 +1,8 @@
 const express = require("express");
+const path = require("path");
+const fs = require("fs");
+const crypto = require("crypto");
+const multer = require("multer");
 const bcrypt = require("bcrypt");
 const pool = require("./db");
 const { runMigrations } = require("./migrate");
@@ -9,9 +13,19 @@ const cors = require("cors");
 
 const app = express();
 
+// Who may use this server from a browser. Set CLIENT_ORIGIN in .env when the
+// site is hosted somewhere else, for example https://chat.example.com
+// (several addresses can be separated with commas).
+const CLIENT_ORIGINS = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const PORT = Number(process.env.PORT) || 3000;
+
 app.use(
   cors({
-    origin: "http://localhost:5173",
+    origin: CLIENT_ORIGINS,
   }),
 );
 
@@ -19,11 +33,140 @@ app.use(express.json());
 
 app.use(express.static("public"));
 
+/* ---------- Photo uploads ----------
+   Photos from chats that save history live in uploads/.
+   Photos from chats that don't save history live in uploads/tmp/ and are
+   deleted automatically after an hour. */
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+const TEMP_DIR = path.join(UPLOAD_DIR, "tmp");
+const TEMP_MAX_AGE_MS = 60 * 60 * 1000;
+const IMAGE_URL_PATTERN = /^\/uploads\/(tmp\/)?[a-f0-9]{32}\.(jpg|png|webp)$/;
+
+fs.mkdirSync(TEMP_DIR, { recursive: true });
+
+app.use(
+  "/uploads",
+  express.static(UPLOAD_DIR, {
+    index: false,
+    dotfiles: "deny",
+    maxAge: "7d",
+    setHeaders: (res) => res.setHeader("X-Content-Type-Options", "nosniff"),
+  }),
+);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+});
+
+// Look at the file's first bytes instead of trusting the name or header.
+function detectImageType(buffer) {
+  if (buffer.length < 12) return null;
+
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return "jpg";
+  }
+
+  if (
+    buffer.subarray(0, 8).equals(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    )
+  ) {
+    return "png";
+  }
+
+  if (
+    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buffer.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "webp";
+  }
+
+  return null;
+}
+
+// Only call these with URLs that already passed IMAGE_URL_PATTERN.
+function uploadPath(url) {
+  return path.join(UPLOAD_DIR, url.replace("/uploads/", ""));
+}
+
+function deleteUpload(url) {
+  if (typeof url !== "string" || !IMAGE_URL_PATTERN.test(url)) return;
+
+  fs.promises.unlink(uploadPath(url)).catch(() => {});
+}
+
+// Moves a photo between the saved folder and the temporary one.
+function moveUpload(url, toTemp) {
+  const isTemp = url.startsWith("/uploads/tmp/");
+
+  if (isTemp === toTemp) return url;
+
+  const name = path.basename(url);
+  const newUrl = toTemp ? `/uploads/tmp/${name}` : `/uploads/${name}`;
+
+  fs.renameSync(uploadPath(url), uploadPath(newUrl));
+
+  return newUrl;
+}
+
+function cleanTempUploads() {
+  fs.readdir(TEMP_DIR, (error, files) => {
+    if (error) return;
+
+    const cutoff = Date.now() - TEMP_MAX_AGE_MS;
+
+    for (const file of files) {
+      const filePath = path.join(TEMP_DIR, file);
+
+      fs.stat(filePath, (statError, stats) => {
+        if (!statError && stats.isFile() && stats.mtimeMs < cutoff) {
+          fs.unlink(filePath, () => {});
+        }
+      });
+    }
+  });
+}
+
+cleanTempUploads();
+setInterval(cleanTempUploads, 10 * 60 * 1000).unref();
+
+// Photos that were uploaded but never attached to a message
+// (for example a failed send) are removed after an hour.
+async function cleanOrphanUploads() {
+  try {
+    const entries = await fs.promises.readdir(UPLOAD_DIR, {
+      withFileTypes: true,
+    });
+    const cutoff = Date.now() - TEMP_MAX_AGE_MS;
+
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+
+      const filePath = path.join(UPLOAD_DIR, entry.name);
+      const stats = await fs.promises.stat(filePath);
+
+      if (stats.mtimeMs > cutoff) continue;
+
+      const used = await pool.query(
+        `SELECT 1 FROM messages WHERE image_url = $1 LIMIT 1`,
+        [`/uploads/${entry.name}`],
+      );
+
+      if (used.rows.length === 0) {
+        await fs.promises.unlink(filePath).catch(() => {});
+      }
+    }
+  } catch (error) {
+    console.log("Orphan upload cleanup error:", error);
+  }
+}
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:5173",
+    origin: CLIENT_ORIGINS,
     methods: ["GET", "POST"],
   },
 });
@@ -47,11 +190,197 @@ io.use((socket, next) => {
   }
 });
 
+/* ---------- Audio / video calls ----------
+   The server only passes WebRTC setup messages between the two people.
+   The audio and video themselves go directly between their browsers. */
+const calls = new Map(); // callId -> call details
+const CALL_END_REASONS = [
+  "hangup",
+  "declined",
+  "cancelled",
+  "no_answer",
+  "failed",
+];
+
+function userInCall(userId) {
+  for (const call of calls.values()) {
+    if (call.callerId === userId || call.calleeId === userId) return true;
+  }
+
+  return false;
+}
+
+function endCall(callId, reason, exceptSocketId) {
+  const call = calls.get(callId);
+
+  if (!call) return;
+
+  calls.delete(callId);
+
+  let target = io
+    .to(`user_${call.callerId}`)
+    .to(`user_${call.calleeId}`);
+
+  if (exceptSocketId) target = target.except(exceptSocketId);
+
+  target.emit("call:ended", { callId, reason });
+}
+
 io.on("connection", (socket) => {
   console.log("A user connected:", socket.id);
 
   // Personal room so we can notify this user about activity in any of their chats.
   socket.join(`user_${socket.userId}`);
+
+  socket.on("call:invite", async (data = {}) => {
+    try {
+      const { callId, callType, offer } = data;
+      const conversationId = Number(data.conversationId);
+
+      if (
+        typeof callId !== "string" ||
+        callId.length === 0 ||
+        callId.length > 64 ||
+        !["audio", "video"].includes(callType) ||
+        typeof offer?.sdp !== "string" ||
+        offer.sdp.length > 20000 ||
+        !Number.isInteger(conversationId)
+      ) {
+        return;
+      }
+
+      const members = await pool.query(
+        `SELECT user_id FROM conversation_members WHERE conversation_id = $1`,
+        [conversationId],
+      );
+
+      const memberIds = members.rows.map((row) => row.user_id);
+
+      if (memberIds.length !== 2 || !memberIds.includes(socket.userId)) {
+        return socket.emit("call:ended", { callId, reason: "unavailable" });
+      }
+
+      const calleeId = memberIds.find((id) => id !== socket.userId);
+
+      const calleeSockets = await io.in(`user_${calleeId}`).fetchSockets();
+
+      if (calleeSockets.length === 0) {
+        return socket.emit("call:ended", { callId, reason: "offline" });
+      }
+
+      // No awaits between this check and calls.set, so two callers
+      // can't both reach the same person.
+      if (calls.has(callId) || userInCall(socket.userId) || userInCall(calleeId)) {
+        return socket.emit("call:ended", { callId, reason: "busy" });
+      }
+
+      calls.set(callId, {
+        callerId: socket.userId,
+        calleeId,
+        conversationId,
+        callType,
+        callerSocketId: socket.id,
+        calleeSocketId: null,
+        answered: false,
+      });
+
+      io.to(`user_${calleeId}`).emit("call:incoming", {
+        callId,
+        conversationId,
+        callType,
+        offer: { type: "offer", sdp: offer.sdp },
+        from: { id: socket.userId, username: socket.username },
+      });
+
+      // Lets the caller start sending network candidates. Anything sent
+      // before this point would be dropped because the call isn't registered yet.
+      socket.emit("call:ringing", { callId });
+    } catch (error) {
+      console.log("Call invite error:", error);
+    }
+  });
+
+  socket.on("call:answer", (data = {}) => {
+    const call = calls.get(data.callId);
+
+    if (
+      !call ||
+      call.answered ||
+      call.calleeId !== socket.userId ||
+      typeof data.answer?.sdp !== "string" ||
+      data.answer.sdp.length > 20000
+    ) {
+      return;
+    }
+
+    call.answered = true;
+    call.calleeSocketId = socket.id;
+
+    // Other tabs of the same person stop ringing.
+    socket.to(`user_${call.calleeId}`).emit("call:taken", {
+      callId: data.callId,
+    });
+
+    io.to(call.callerSocketId).emit("call:answered", {
+      callId: data.callId,
+      answer: { type: "answer", sdp: data.answer.sdp },
+    });
+  });
+
+  socket.on("call:ice", (data = {}) => {
+    const call = calls.get(data.callId);
+
+    if (!call || !data.candidate) return;
+
+    if (JSON.stringify(data.candidate).length > 4000) return;
+
+    let target = null;
+
+    if (socket.id === call.callerSocketId) {
+      target = call.answered
+        ? call.calleeSocketId
+        : `user_${call.calleeId}`;
+    } else if (call.answered && socket.id === call.calleeSocketId) {
+      target = call.callerSocketId;
+    }
+
+    if (!target) return;
+
+    io.to(target).emit("call:ice", {
+      callId: data.callId,
+      candidate: data.candidate,
+    });
+  });
+
+  socket.on("call:end", (data = {}) => {
+    const call = calls.get(data.callId);
+
+    if (!call) return;
+
+    const isCaller = socket.id === call.callerSocketId;
+    const isCallee =
+      socket.userId === call.calleeId &&
+      (!call.answered || socket.id === call.calleeSocketId);
+
+    if (!isCaller && !isCallee) return;
+
+    const reason = CALL_END_REASONS.includes(data.reason)
+      ? data.reason
+      : "hangup";
+
+    endCall(data.callId, reason, socket.id);
+  });
+
+  socket.on("disconnect", () => {
+    for (const [callId, call] of calls) {
+      if (
+        call.callerSocketId === socket.id ||
+        call.calleeSocketId === socket.id
+      ) {
+        endCall(callId, "disconnected", socket.id);
+      }
+    }
+  });
 
   socket.on("join_room", async (room) => {
     try {
@@ -88,7 +417,7 @@ io.on("connection", (socket) => {
       // Load saved messages only for authorized members.
       const result = await pool.query(
         `
-      SELECT id, username, content, created_at
+      SELECT id, username, content, message_type, image_url, created_at
       FROM messages
       WHERE room = $1
       ORDER BY created_at ASC
@@ -104,6 +433,13 @@ io.on("connection", (socket) => {
 
   socket.on("chat_message", async (data) => {
     try {
+      if (
+        typeof data?.room !== "string" ||
+        !/^conversation_\d+$/.test(data.room)
+      ) {
+        return;
+      }
+
       const conversationId = Number(data.room.replace("conversation_", ""));
 
       const members = await pool.query(
@@ -134,20 +470,50 @@ io.on("connection", (socket) => {
       );
       const keepHistory = settings.rows[0]?.keep_history === true;
 
+      const isImage = data.type === "image";
+      let imageUrl = null;
+      let content;
+
+      if (isImage) {
+        if (
+          typeof data.imageUrl !== "string" ||
+          !IMAGE_URL_PATTERN.test(data.imageUrl) ||
+          !fs.existsSync(uploadPath(data.imageUrl))
+        ) {
+          return;
+        }
+
+        // Keep the file where the chat's history setting says it belongs.
+        imageUrl = moveUpload(data.imageUrl, !keepHistory);
+        content = "📷 Photo";
+      } else {
+        if (typeof data.message !== "string" || !data.message.trim()) return;
+
+        content = data.message;
+      }
+
       if (keepHistory) {
         await pool.query(
           `
-        INSERT INTO messages (room, username, content)
-        VALUES ($1, $2, $3)
+        INSERT INTO messages (room, username, content, message_type, image_url)
+        VALUES ($1, $2, $3, $4, $5)
         `,
-          [data.room, socket.username, data.message],
+          [
+            data.room,
+            socket.username,
+            content,
+            isImage ? "image" : "text",
+            imageUrl,
+          ],
         );
       }
 
       io.to(data.room).emit("chat_message", {
         room: data.room,
         username: socket.username,
-        message: data.message,
+        message: content,
+        type: isImage ? "image" : "text",
+        imageUrl,
         keepHistory,
       });
 
@@ -163,7 +529,7 @@ io.on("connection", (socket) => {
         `,
         [
           conversationId,
-          keepHistory ? String(data.message).slice(0, 200) : null,
+          keepHistory ? content.slice(0, 200) : null,
           keepHistory ? socket.username : null,
         ],
       );
@@ -185,7 +551,7 @@ io.on("connection", (socket) => {
           conversationId,
           room: data.room,
           username: socket.username,
-          message: data.message,
+          message: content,
         });
       }
     } catch (error) {
@@ -332,6 +698,60 @@ app.post("/login", async (req, res) => {
       message: "Login failed",
     });
   }
+});
+
+/* ---------- Calls: STUN / TURN servers ----------
+   STUN lets two browsers find each other. TURN relays the call when they
+   can't connect directly (different networks, strict firewalls).
+
+   Set these in .env to turn relaying on:
+     TURN_URLS    comma-separated, e.g. turn:turn.example.com:3478,turns:turn.example.com:443?transport=tcp
+     TURN_SECRET  the same secret as static-auth-secret in coturn (recommended:
+                  each person gets a temporary password), or
+     TURN_USERNAME + TURN_CREDENTIAL for a fixed login (hosted TURN services)
+     TURN_TTL_SECONDS  how long a temporary password lasts (default 86400) */
+const DEFAULT_STUN = [
+  "stun:stun.l.google.com:19302",
+  "stun:stun1.l.google.com:19302",
+];
+
+function splitList(value) {
+  return (value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+app.get("/ice-servers", authenticateToken, (req, res) => {
+  const stunUrls = splitList(process.env.STUN_URLS);
+  const turnUrls = splitList(process.env.TURN_URLS);
+  const ttl = Number(process.env.TURN_TTL_SECONDS) || 24 * 60 * 60;
+
+  const iceServers = [{ urls: stunUrls.length ? stunUrls : DEFAULT_STUN }];
+
+  if (turnUrls.length > 0) {
+    if (process.env.TURN_SECRET) {
+      // coturn "REST API" login: the username carries the expiry time and
+      // the password is a signature of it, so nothing permanent is shared.
+      const username = `${Math.floor(Date.now() / 1000) + ttl}:${req.user.userId}`;
+      const credential = crypto
+        .createHmac("sha1", process.env.TURN_SECRET)
+        .update(username)
+        .digest("base64");
+
+      iceServers.push({ urls: turnUrls, username, credential });
+    } else if (process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+      iceServers.push({
+        urls: turnUrls,
+        username: process.env.TURN_USERNAME,
+        credential: process.env.TURN_CREDENTIAL,
+      });
+    }
+  }
+
+  // Never cache: the temporary password is different for each request.
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ iceServers, ttl });
 });
 
 app.get("/me", authenticateToken, async (req, res) => {
@@ -783,6 +1203,89 @@ app.post("/conversations", authenticateToken, async (req, res) => {
   }
 });
 
+app.post(
+  "/conversations/:id/images",
+  authenticateToken,
+  async (req, res, next) => {
+    const conversationId = Number(req.params.id);
+
+    if (!Number.isInteger(conversationId)) {
+      return res.status(400).json({ message: "Invalid conversation" });
+    }
+
+    try {
+      // Only people in the conversation can upload to it.
+      const result = await pool.query(
+        `
+        SELECT c.keep_history
+        FROM conversations c
+        JOIN conversation_members m ON m.conversation_id = c.id
+        WHERE c.id = $1
+          AND m.user_id = $2
+        `,
+        [conversationId, req.user.userId],
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          message: "Conversation not found",
+        });
+      }
+
+      res.locals.keepHistory = result.rows[0].keep_history === true;
+      next();
+    } catch (error) {
+      console.log("Upload check error:", error);
+
+      res.status(500).json({ message: "Failed to upload photo" });
+    }
+  },
+  (req, res, next) => {
+    upload.single("image")(req, res, (error) => {
+      if (!error) return next();
+
+      const tooLarge = error.code === "LIMIT_FILE_SIZE";
+
+      res.status(tooLarge ? 413 : 400).json({
+        message: tooLarge
+          ? "That photo is too large (5 MB max)"
+          : "The upload didn't work. Please try again.",
+      });
+    });
+  },
+  async (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ message: "No photo was uploaded" });
+    }
+
+    const type = detectImageType(req.file.buffer);
+
+    if (!type) {
+      return res.status(400).json({
+        message: "Only JPEG, PNG and WebP photos are allowed",
+      });
+    }
+
+    const name = `${crypto.randomBytes(16).toString("hex")}.${type}`;
+    const keepHistory = res.locals.keepHistory;
+
+    try {
+      await fs.promises.writeFile(
+        path.join(keepHistory ? UPLOAD_DIR : TEMP_DIR, name),
+        req.file.buffer,
+      );
+
+      res.json({
+        url: keepHistory ? `/uploads/${name}` : `/uploads/tmp/${name}`,
+      });
+    } catch (error) {
+      console.log("Upload save error:", error);
+
+      res.status(500).json({ message: "Failed to save photo" });
+    }
+  },
+);
+
 app.get("/conversations", authenticateToken, async (req, res) => {
   const currentUserId = req.user.userId;
 
@@ -927,11 +1430,16 @@ app.delete("/messages", authenticateToken, async (req, res) => {
 
     if (ids.length > 0) {
       const result = await pool.query(
-        `DELETE FROM messages WHERE room = ANY($1::text[])`,
+        `DELETE FROM messages WHERE room = ANY($1::text[]) RETURNING image_url`,
         [rooms],
       );
 
       deleted = result.rowCount;
+
+      // Remove the saved photo files too, not just the database rows.
+      for (const row of result.rows) {
+        deleteUpload(row.image_url);
+      }
 
       await pool.query(
         `
@@ -983,8 +1491,12 @@ app.delete("/messages", authenticateToken, async (req, res) => {
 // Update the database first, then start accepting connections.
 runMigrations()
   .then(() => {
-    server.listen(3000, () => {
-      console.log("Server is running on port 3000");
+    // Needs the database to be up to date first.
+    cleanOrphanUploads();
+    setInterval(cleanOrphanUploads, 30 * 60 * 1000).unref();
+
+    server.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
     });
   })
   .catch((error) => {

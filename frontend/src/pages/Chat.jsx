@@ -2,33 +2,22 @@ import { useEffect, useMemo, useState, useRef } from "react";
 import { io } from "socket.io-client";
 import { useNavigate } from "react-router-dom";
 import { clearSession } from "../auth";
+import Avatar from "../components/Avatar";
+import CameraModal from "../components/CameraModal";
+import CallOverlay from "../components/CallOverlay";
+import {
+  CameraIcon,
+  CloseIcon,
+  ImageIcon,
+  PhoneIcon,
+  VideoIcon,
+} from "../components/icons";
+import { useCall } from "../useCall";
+import { prepareImage } from "../image";
+import { API_URL } from "../config";
+
 
 /* ---------- Small helpers ---------- */
-
-const AVATAR_COLORS = [
-  "bg-teal-700",
-  "bg-sky-700",
-  "bg-emerald-700",
-  "bg-indigo-700",
-  "bg-cyan-700",
-  "bg-rose-700",
-];
-
-function Avatar({ name = "?", size = "h-12 w-12", text = "text-base" }) {
-  const color =
-    AVATAR_COLORS[
-      [...name].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) %
-        AVATAR_COLORS.length
-    ];
-
-  return (
-    <div
-      className={`${size} ${text} ${color} flex shrink-0 items-center justify-center rounded-full font-semibold uppercase text-white`}
-    >
-      {name.charAt(0)}
-    </div>
-  );
-}
 
 function PlusIcon() {
   return (
@@ -147,6 +136,35 @@ function playPing() {
 
 /* ---------- Main component ---------- */
 
+// A photo inside the conversation. Tap it to see it full size.
+function ChatImage({ src, onOpen, onLoaded }) {
+  const [failed, setFailed] = useState(false);
+
+  if (failed) {
+    return (
+      <div className="flex h-32 w-48 items-center justify-center rounded-2xl bg-slate-800 px-3 text-center text-sm text-slate-400">
+        This photo is no longer available
+      </div>
+    );
+  }
+
+  return (
+    <button
+      onClick={() => onOpen(src)}
+      className="max-w-[70%] overflow-hidden rounded-2xl bg-slate-800"
+      aria-label="Open photo"
+    >
+      <img
+        src={src}
+        alt="Photo"
+        onLoad={onLoaded}
+        onError={() => setFailed(true)}
+        className="block max-h-72 max-w-full object-cover"
+      />
+    </button>
+  );
+}
+
 function Chat() {
   const [conversations, setConversations] = useState([]);
   const [activeConversation, setActiveConversation] = useState(null);
@@ -168,6 +186,16 @@ function Chat() {
   const [showPanic, setShowPanic] = useState(false);
   const [panicBusy, setPanicBusy] = useState(false);
   const [panicError, setPanicError] = useState("");
+
+  // Photos and calls
+  const [pendingImage, setPendingImage] = useState(null);
+  const [sendingImage, setSendingImage] = useState(false);
+  const [imageError, setImageError] = useState("");
+  const [showCamera, setShowCamera] = useState(false);
+  const [viewerImage, setViewerImage] = useState(null);
+  const fileInputRef = useRef(null);
+  const cameraInputRef = useRef(null);
+  const callApi = useCall(socket);
 
   // Message request state
   const [incomingRequests, setIncomingRequests] = useState([]);
@@ -250,7 +278,7 @@ function Chat() {
   function markRead(conversationId) {
     clearUnread(conversationId);
 
-    fetch(`http://localhost:3000/conversations/${conversationId}/read`, {
+    fetch(`${API_URL}/conversations/${conversationId}/read`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${sessionStorage.getItem("token")}`,
@@ -287,7 +315,7 @@ function Chat() {
     try {
       const token = sessionStorage.getItem("token");
 
-      const response = await fetch("http://localhost:3000/conversations", {
+      const response = await fetch(`${API_URL}/conversations`, {
         headers: { Authorization: `Bearer ${token}` },
       });
 
@@ -322,7 +350,7 @@ function Chat() {
   async function loadIncomingRequests() {
     try {
       const response = await fetch(
-        "http://localhost:3000/message-requests/incoming",
+        `${API_URL}/message-requests/incoming`,
         {
           headers: {
             Authorization: `Bearer ${sessionStorage.getItem("token")}`,
@@ -391,7 +419,7 @@ function Chat() {
       return;
     }
 
-    const newSocket = io("http://localhost:3000", {
+    const newSocket = io(API_URL, {
       auth: { token },
     });
 
@@ -478,6 +506,8 @@ function Chat() {
           id: `${Date.now()}-${Math.random()}`,
           username: message.username,
           content: message.message,
+          message_type: message.type || "text",
+          image_url: message.imageUrl || null,
         },
       ]);
     }
@@ -590,7 +620,7 @@ function Chat() {
 
     try {
       const response = await fetch(
-        `http://localhost:3000/users/search?id=${encodeURIComponent(id)}`,
+        `${API_URL}/users/search?id=${encodeURIComponent(id)}`,
         {
           headers: {
             Authorization: `Bearer ${sessionStorage.getItem("token")}`,
@@ -627,7 +657,7 @@ function Chat() {
     setSendingRequest(true);
 
     try {
-      const response = await fetch("http://localhost:3000/message-requests", {
+      const response = await fetch(`${API_URL}/message-requests`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -672,7 +702,7 @@ function Chat() {
 
     try {
       const response = await fetch(
-        `http://localhost:3000/message-requests/${requestId}/respond`,
+        `${API_URL}/message-requests/${requestId}/respond`,
         {
           method: "POST",
           headers: {
@@ -756,7 +786,7 @@ function Chat() {
     setStartingChat(true);
 
     try {
-      const response = await fetch("http://localhost:3000/conversations", {
+      const response = await fetch(`${API_URL}/conversations`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -800,7 +830,7 @@ function Chat() {
     setSettingsError("");
 
     try {
-      const response = await fetch("http://localhost:3000/settings/history", {
+      const response = await fetch(`${API_URL}/settings/history`, {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
@@ -835,7 +865,7 @@ function Chat() {
     setPanicError("");
 
     try {
-      const response = await fetch("http://localhost:3000/messages", {
+      const response = await fetch(`${API_URL}/messages`, {
         method: "DELETE",
         headers: {
           Authorization: `Bearer ${sessionStorage.getItem("token")}`,
@@ -854,6 +884,104 @@ function Chat() {
     } finally {
       setPanicBusy(false);
     }
+  }
+
+  function scrollToBottom() {
+    messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
+  }
+
+  function closePendingImage() {
+    if (pendingImage) URL.revokeObjectURL(pendingImage.url);
+
+    setPendingImage(null);
+    setImageError("");
+  }
+
+  async function handleImageChosen(file, source) {
+    setImageError("");
+
+    try {
+      const blob = await prepareImage(file);
+
+      setPendingImage({ blob, url: URL.createObjectURL(blob), source });
+    } catch (error) {
+      console.error("Image error:", error);
+      setImageError("That file couldn't be read as a photo.");
+    }
+  }
+
+  function openCamera() {
+    if (navigator.mediaDevices?.getUserMedia) {
+      setShowCamera(true);
+    } else {
+      // Phones can still open their camera app this way.
+      cameraInputRef.current?.click();
+    }
+  }
+
+  function handleCameraCapture(blob) {
+    setShowCamera(false);
+    handleImageChosen(blob, "camera");
+  }
+
+  async function sendPendingImage() {
+    if (!pendingImage || !activeConversation || !socket) return;
+
+    const conversationId = activeConversation.conversation_id;
+
+    setSendingImage(true);
+    setImageError("");
+
+    try {
+      const form = new FormData();
+      form.append("image", pendingImage.blob, "photo.jpg");
+
+      const response = await fetch(
+        `${API_URL}/conversations/${conversationId}/images`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${sessionStorage.getItem("token")}`,
+          },
+          body: form,
+        },
+      );
+
+      if (response.status === 401 || response.status === 403) {
+        logout();
+        return;
+      }
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data.message || "Couldn't send the photo.");
+      }
+
+      socket.emit("chat_message", {
+        room: `conversation_${conversationId}`,
+        type: "image",
+        imageUrl: data.url,
+      });
+
+      bumpConversation(conversationId);
+      closePendingImage();
+    } catch (error) {
+      console.error("Send photo error:", error);
+      setImageError(error.message || "Couldn't send the photo.");
+    } finally {
+      setSendingImage(false);
+    }
+  }
+
+  function startCallWith(type) {
+    if (!activeConversation) return;
+
+    callApi.startCall({
+      conversationId: activeConversation.conversation_id,
+      username: activeConversation.username,
+      type,
+    });
   }
 
   function openConversation(conversation) {
@@ -1132,14 +1260,35 @@ function Chat() {
               </button>
 
               <button
+                onClick={() => startCallWith("audio")}
+                disabled={!!callApi.call}
+                className="shrink-0 rounded-full p-2 text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-40"
+                aria-label="Start a voice call"
+                title="Voice call"
+              >
+                <PhoneIcon className="h-5 w-5" />
+              </button>
+
+              <button
+                onClick={() => startCallWith("video")}
+                disabled={!!callApi.call}
+                className="shrink-0 rounded-full p-2 text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-40"
+                aria-label="Start a video call"
+                title="Video call"
+              >
+                <VideoIcon className="h-5 w-5" />
+              </button>
+
+              <button
                 onClick={() => {
                   setPanicError("");
                   setShowPanic(true);
                 }}
                 className="flex shrink-0 items-center gap-1.5 rounded-lg bg-red-600/15 px-3 py-1.5 text-sm font-semibold text-red-400 hover:bg-red-600/25"
+                aria-label="Panic"
               >
                 <WarningIcon />
-                Panic
+                <span className="hidden sm:inline">Panic</span>
               </button>
             </header>
 
@@ -1188,15 +1337,23 @@ function Chat() {
                         />
                       </button>
 
-                      <div
-                        className={`max-w-[70%] wrap-break-word rounded-2xl px-4 py-2 ${
-                          isMine
-                            ? "rounded-br-sm bg-teal-600 text-white"
-                            : "rounded-bl-sm bg-slate-800 text-slate-100"
-                        }`}
-                      >
-                        {msg.content ?? msg.message}
-                      </div>
+                      {msg.message_type === "image" && msg.image_url ? (
+                        <ChatImage
+                          src={`${API_URL}${msg.image_url}`}
+                          onOpen={setViewerImage}
+                          onLoaded={scrollToBottom}
+                        />
+                      ) : (
+                        <div
+                          className={`max-w-[70%] wrap-break-word rounded-2xl px-4 py-2 ${
+                            isMine
+                              ? "rounded-br-sm bg-teal-600 text-white"
+                              : "rounded-bl-sm bg-slate-800 text-slate-100"
+                          }`}
+                        >
+                          {msg.content ?? msg.message}
+                        </div>
+                      )}
                     </div>
                   );
                 })
@@ -1207,7 +1364,29 @@ function Chat() {
 
             {/* Message input */}
             <footer className="shrink-0 border-t border-slate-800 bg-slate-950 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:p-4">
+              {imageError && !pendingImage && (
+                <p className="mb-2 text-sm text-red-400">{imageError}</p>
+              )}
+
               <div className="flex gap-2">
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="shrink-0 self-center rounded-full p-2 text-slate-300 hover:bg-slate-800 hover:text-white"
+                  aria-label="Send a photo"
+                  title="Send a photo"
+                >
+                  <ImageIcon />
+                </button>
+
+                <button
+                  onClick={openCamera}
+                  className="shrink-0 self-center rounded-full p-2 text-slate-300 hover:bg-slate-800 hover:text-white"
+                  aria-label="Take a photo"
+                  title="Take a photo"
+                >
+                  <CameraIcon />
+                </button>
+
                 <input
                   type="text"
                   placeholder="Write a message..."
@@ -1227,10 +1406,111 @@ function Chat() {
                   Send
                 </button>
               </div>
+
+              {/* Hidden pickers */}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (file) handleImageChosen(file, "file");
+                }}
+              />
+
+              <input
+                ref={cameraInputRef}
+                type="file"
+                accept="image/*"
+                capture="environment"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (file) handleImageChosen(file, "camera");
+                }}
+              />
             </footer>
           </>
         )}
       </main>
+
+      {/* ================= Photo preview ================= */}
+      {pendingImage && (
+        <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/85 p-4">
+          <img
+            src={pendingImage.url}
+            alt="Photo to send"
+            className="max-h-[70dvh] max-w-full rounded-2xl object-contain"
+          />
+
+          {imageError && (
+            <p className="mt-3 text-sm text-red-400">{imageError}</p>
+          )}
+
+          <div className="mt-5 flex w-full max-w-sm gap-3">
+            <button
+              onClick={closePendingImage}
+              disabled={sendingImage}
+              className="flex-1 rounded-lg bg-slate-800 py-3 font-semibold hover:bg-slate-700 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+
+            {pendingImage.source === "camera" && (
+              <button
+                onClick={() => {
+                  closePendingImage();
+                  openCamera();
+                }}
+                disabled={sendingImage}
+                className="flex-1 rounded-lg bg-slate-800 py-3 font-semibold hover:bg-slate-700 disabled:opacity-50"
+              >
+                Retake
+              </button>
+            )}
+
+            <button
+              onClick={sendPendingImage}
+              disabled={sendingImage}
+              className="flex-1 rounded-lg bg-teal-600 py-3 font-semibold hover:bg-teal-500 disabled:opacity-50"
+            >
+              {sendingImage ? "Sending..." : "Send"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {showCamera && (
+        <CameraModal
+          onCapture={handleCameraCapture}
+          onClose={() => setShowCamera(false)}
+        />
+      )}
+
+      {viewerImage && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4"
+          onClick={() => setViewerImage(null)}
+        >
+          <button
+            onClick={() => setViewerImage(null)}
+            className="absolute right-4 top-4 rounded-full bg-white/10 p-2 text-white hover:bg-white/20"
+            aria-label="Close photo"
+          >
+            <CloseIcon />
+          </button>
+
+          <img
+            src={viewerImage}
+            alt="Photo"
+            className="max-h-full max-w-full object-contain"
+            onClick={(event) => event.stopPropagation()}
+          />
+        </div>
+      )}
 
       {/* ================= Settings modal ================= */}
       {showSettings && (
@@ -1260,7 +1540,7 @@ function Chat() {
                 <p className="mt-1 text-sm text-slate-400">
                   {historyEnabled
                     ? "New messages are saved and show up when you reopen a chat."
-                    : "New messages aren't saved. They disappear when you close the chat."}
+                    : "New messages aren't saved. They disappear when you close the chat, and photos are deleted from the server after an hour."}
                 </p>
               </div>
 
@@ -1726,6 +2006,19 @@ function Chat() {
           </div>
         </div>
       )}
+
+      {/* ================= Calls ================= */}
+      <CallOverlay
+        call={callApi.call}
+        localStream={callApi.localStream}
+        remoteStream={callApi.remoteStream}
+        notice={callApi.notice}
+        onAccept={callApi.acceptCall}
+        onDecline={callApi.declineCall}
+        onHangUp={callApi.hangUp}
+        onToggleMute={callApi.toggleMute}
+        onToggleCamera={callApi.toggleCamera}
+      />
     </div>
   );
 }

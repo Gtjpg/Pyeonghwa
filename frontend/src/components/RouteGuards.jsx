@@ -17,4 +17,4 @@ export function ProtectedRoute() {
   if (status === "invalid") return <Navigate to="/" replace />;
 
   return <Outlet />;
-}
+} 

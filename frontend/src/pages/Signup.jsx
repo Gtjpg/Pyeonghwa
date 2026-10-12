@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { API_URL } from "../config";
 
 function Signup() {
   const [username, setUsername] = useState("");
@@ -11,7 +12,7 @@ function Signup() {
 
   const handleSignup = async () => {
     try {
-      const response = await fetch("http://localhost:3000/signup", {
+      const response = await fetch(`${API_URL}/signup`, {
         method: "POST",
 
         headers: {
