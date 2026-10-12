@@ -1,0 +1,682 @@
+diff --git a/TURN_SETUP.md b/TURN_SETUP.md
+new file mode 100644
+index 0000000..cbbbd12
+--- /dev/null
++++ b/TURN_SETUP.md
+@@ -0,0 +1,178 @@
++# Calls between different networks
++
++## What is going on
++
++Audio and video go **directly between the two browsers**. That works when both
++people are on the same Wi-Fi, and often even on different home networks. It
++fails on many mobile-data connections, school and office networks, and anything
++with a strict firewall.
++
++The fix is a **TURN relay**: a small server on the internet that passes the call
++through when a direct connection isn't possible. This project is set up for
++**coturn**, the standard free relay.
++
++Two things are needed for calls to work across networks:
++
++1. **A TURN relay** (this guide, steps 1 to 6).
++2. **Your site reachable on the internet over `https`**, because browsers only
++   allow the camera and microphone on `https` pages (or `localhost`). See
++   "Putting the site online" at the end.
++
++### About "limitless"
++
++- Nothing in the app limits the number of calls, how long they last, or the video
++  quality.
++- A relay you run yourself has no usage limit either. The only limits are your
++  server's internet speed and your hosting plan's data allowance.
++- Most calls connect directly and never touch the relay. Only the calls that
++  can't connect directly use its bandwidth.
++- Hosted TURN services (Twilio, Metered, Cloudflare, Xirsys and others) are
++  easier but their free plans do have data limits. Running coturn yourself is
++  the way to avoid limits.
++
++---
++
++## Step 1: Get a server and a domain name
++
++- Any small Linux server (VPS) with a **public IP address** works. A relay uses
++  very little CPU; its bandwidth is what matters.
++- Point a domain name at it, for example an **A record**
++  `turn.example.com -> 203.0.113.10`.
++
++## Step 2: Install coturn
++
++```bash
++sudo apt update
++sudo apt install coturn
++```
++
++## Step 3: Configure it
++
++Copy `coturn/turnserver.conf` from this project to `/etc/turnserver.conf` on the
++server and change the three marked settings:
++
++- `realm` and `server-name`: your domain (`turn.example.com`).
++- `static-auth-secret`: a long random secret. Make one with:
++
++  ```bash
++  openssl rand -hex 32
++  ```
++
++If your provider uses a private address behind a public one (AWS, Google Cloud,
++Oracle and similar), also uncomment `external-ip=` and put your public address
++there.
++
++Then start it:
++
++```bash
++sudo systemctl enable --now coturn
++sudo systemctl status coturn
++```
++
++## Step 4: Open the firewall
++
++On the server **and** in your cloud provider's firewall / security group:
++
++| Port | Protocol | What for |
++| --- | --- | --- |
++| 3478 | UDP and TCP | TURN |
++| 5349 | TCP | TURN over TLS (`turns:`) |
++| 49152 to 65535 | UDP | the relayed audio and video |
++
++With `ufw`:
++
++```bash
++sudo ufw allow 3478
++sudo ufw allow 5349/tcp
++sudo ufw allow 49152:65535/udp
++```
++
++## Step 5 (recommended): Add a certificate for `turns:`
++
++`turns:` is TURN inside TLS. It gets through stricter firewalls that block
++plain TURN.
++
++```bash
++sudo apt install certbot
++sudo certbot certonly --standalone -d turn.example.com
++```
++
++Uncomment the `cert=` and `pkey=` lines in `/etc/turnserver.conf`, make sure the
++coturn user can read those files, and restart: `sudo systemctl restart coturn`.
++
++## Step 6: Tell the backend about it
++
++In `backend/.env` (there is a template in `backend/.env.example`):
++
++```env
++TURN_URLS=turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp,turns:turn.example.com:5349?transport=tcp
++TURN_SECRET=the-same-secret-as-static-auth-secret
++```
++
++Restart the backend. People now get a **temporary** relay password (valid for 24
++hours, different for every person) each time they start a call, so no permanent
++password is stored in the website.
++
++Using a hosted TURN service instead of your own coturn? Use their fixed login:
++
++```env
++TURN_URLS=turn:their-server.example.net:443
++TURN_USERNAME=your-username
++TURN_CREDENTIAL=your-password
++```
++
++### Check that it works
++
++1. Log in, open the browser's developer tools (F12), go to **Network**, and start
++   a call. Click the `ice-servers` request and read its **Response**. It should
++   contain a `turn:` entry with a `username` and a `credential`.
++2. Paste those three values (URL, username, credential) into the free
++   **Trickle ICE** test page
++   (`webrtc.github.io/samples/src/content/peerconnection/trickle-ice/`) and
++   press "Gather candidates". A line of type **relay** means your relay works.
++3. In `frontend/.env` set `VITE_FORCE_RELAY=true`, restart `npm run dev`, and call
++   from another network (for example your phone on mobile data). If the call
++   connects, everything is working. Remove that line afterwards.
++
++---
++
++## Putting the site online
++
++For two people on different networks to open your site, it needs a public
++address with `https`. The app now reads these from settings, so no code changes
++are needed.
++
++**Backend** (`backend/.env`):
++
++```env
++PORT=3000
++CLIENT_ORIGIN=https://chat.example.com
++```
++
++**Frontend** (`frontend/.env`, then run `npm run build` and host the `dist`
++folder):
++
++```env
++VITE_API_URL=https://api.example.com
++```
++
++- Both addresses must be `https`.
++- If a reverse proxy (nginx, Caddy, and so on) sits in front of the backend, it
++  must allow **WebSocket** connections for `/socket.io/`, and uploads of up to
++  5 MB.
++- The backend stores photos in `backend/uploads/`. On hosts that wipe the disk
++  on every deploy, use a persistent disk or the photos will disappear.
++
++For a quick try before a proper deployment, a tunnelling tool such as Cloudflare
++Tunnel or ngrok can give your two local ports (5173 and 3000) public `https`
++addresses. Use those two addresses for `CLIENT_ORIGIN` and `VITE_API_URL`.
++
++---
++
++## Safety notes
++
++- Never put `TURN_SECRET` in the frontend or commit it to git. It belongs only in
++  `backend/.env` and in coturn's config.
++- The config already stops the relay from being used to reach private or
++  internal network addresses. Keep the `denied-peer-ip` lines.
++- Keep the secret private; whoever has it can create relay logins.
+diff --git a/backend/.env.example b/backend/.env.example
+new file mode 100644
+index 0000000..d98510a
+--- /dev/null
++++ b/backend/.env.example
+@@ -0,0 +1,22 @@
++# ---------- Database ----------
++DB_HOST=localhost
++DB_PORT=5432
++DB_NAME=pyeonghwa
++DB_USER=postgres
++DB_PASSWORD=change-me
++
++# ---------- Login tokens ----------
++JWT_SECRET=use-a-long-random-string
++
++# ---------- Server ----------
++PORT=3000
++# The address people open the website at. Use https:// when it is hosted online.
++CLIENT_ORIGIN=http://localhost:5173
++
++# ---------- Calls across different networks (TURN relay) ----------
++# See TURN_SETUP.md. Leave these empty to use direct calls only.
++TURN_URLS=
++TURN_SECRET=
++# Hosted TURN service with one fixed login instead of TURN_SECRET:
++# TURN_USERNAME=
++# TURN_CREDENTIAL=
+diff --git a/backend/server.js b/backend/server.js
+index 9e0b5bb..517d293 100644
+--- a/backend/server.js
++++ b/backend/server.js
+@@ -13,9 +13,19 @@ const cors = require("cors");
+ 
+ const app = express();
+ 
++// Who may use this server from a browser. Set CLIENT_ORIGIN in .env when the
++// site is hosted somewhere else, for example https://chat.example.com
++// (several addresses can be separated with commas).
++const CLIENT_ORIGINS = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
++  .split(",")
++  .map((origin) => origin.trim())
++  .filter(Boolean);
++
++const PORT = Number(process.env.PORT) || 3000;
++
+ app.use(
+   cors({
+-    origin: "http://localhost:5173",
++    origin: CLIENT_ORIGINS,
+   }),
+ );
+ 
+@@ -156,7 +166,7 @@ const server = http.createServer(app);
+ 
+ const io = new Server(server, {
+   cors: {
+-    origin: "http://localhost:5173",
++    origin: CLIENT_ORIGINS,
+     methods: ["GET", "POST"],
+   },
+ });
+@@ -690,6 +700,60 @@ app.post("/login", async (req, res) => {
+   }
+ });
+ 
++/* ---------- Calls: STUN / TURN servers ----------
++   STUN lets two browsers find each other. TURN relays the call when they
++   can't connect directly (different networks, strict firewalls).
++
++   Set these in .env to turn relaying on:
++     TURN_URLS    comma-separated, e.g. turn:turn.example.com:3478,turns:turn.example.com:443?transport=tcp
++     TURN_SECRET  the same secret as static-auth-secret in coturn (recommended:
++                  each person gets a temporary password), or
++     TURN_USERNAME + TURN_CREDENTIAL for a fixed login (hosted TURN services)
++     TURN_TTL_SECONDS  how long a temporary password lasts (default 86400) */
++const DEFAULT_STUN = [
++  "stun:stun.l.google.com:19302",
++  "stun:stun1.l.google.com:19302",
++];
++
++function splitList(value) {
++  return (value || "")
++    .split(",")
++    .map((item) => item.trim())
++    .filter(Boolean);
++}
++
++app.get("/ice-servers", authenticateToken, (req, res) => {
++  const stunUrls = splitList(process.env.STUN_URLS);
++  const turnUrls = splitList(process.env.TURN_URLS);
++  const ttl = Number(process.env.TURN_TTL_SECONDS) || 24 * 60 * 60;
++
++  const iceServers = [{ urls: stunUrls.length ? stunUrls : DEFAULT_STUN }];
++
++  if (turnUrls.length > 0) {
++    if (process.env.TURN_SECRET) {
++      // coturn "REST API" login: the username carries the expiry time and
++      // the password is a signature of it, so nothing permanent is shared.
++      const username = `${Math.floor(Date.now() / 1000) + ttl}:${req.user.userId}`;
++      const credential = crypto
++        .createHmac("sha1", process.env.TURN_SECRET)
++        .update(username)
++        .digest("base64");
++
++      iceServers.push({ urls: turnUrls, username, credential });
++    } else if (process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
++      iceServers.push({
++        urls: turnUrls,
++        username: process.env.TURN_USERNAME,
++        credential: process.env.TURN_CREDENTIAL,
++      });
++    }
++  }
++
++  // Never cache: the temporary password is different for each request.
++  res.setHeader("Cache-Control", "no-store");
++  res.json({ iceServers, ttl });
++});
++
+ app.get("/me", authenticateToken, async (req, res) => {
+   try {
+     const result = await pool.query(
+@@ -1431,8 +1495,8 @@ runMigrations()
+     cleanOrphanUploads();
+     setInterval(cleanOrphanUploads, 30 * 60 * 1000).unref();
+ 
+-    server.listen(3000, () => {
+-      console.log("Server is running on port 3000");
++    server.listen(PORT, () => {
++      console.log(`Server is running on port ${PORT}`);
+     });
+   })
+   .catch((error) => {
+diff --git a/coturn/turnserver.conf b/coturn/turnserver.conf
+new file mode 100644
+index 0000000..152c77d
+--- /dev/null
++++ b/coturn/turnserver.conf
+@@ -0,0 +1,56 @@
++# coturn settings for Pyeonghwa calls.
++# Copy to /etc/turnserver.conf on a server with a public IP address, change the
++# three settings marked CHANGE, then restart coturn (see TURN_SETUP.md).
++
++# ---------- Ports ----------
++listening-port=3478
++# For the secure turns: address you also need a certificate (see the end).
++tls-listening-port=5349
++
++# ---------- Your server ----------
++# CHANGE the next two lines to your domain name.
++realm=turn.example.com
++server-name=turn.example.com
++# Servers that sit behind NAT (AWS, Google Cloud, Oracle and similar) must
++# state their public address. Use "PUBLIC_IP" or "PUBLIC_IP/PRIVATE_IP".
++# external-ip=203.0.113.10
++
++# ---------- Login ----------
++# People get a temporary password from your backend (TURN_SECRET in backend/.env
++# must be the same value as below). No accounts or passwords to manage.
++use-auth-secret
++# CHANGE this to a long random secret (for example: openssl rand -hex 32).
++static-auth-secret=CHANGE_ME_TO_A_LONG_RANDOM_SECRET
++
++# ---------- Relay ports ----------
++# Open this UDP range in your firewall, together with 3478 (UDP and TCP).
++min-port=49152
++max-port=65535
++
++# ---------- Safety ----------
++fingerprint
++no-multicast-peers
++no-cli
++# Stops anyone from using your relay to reach private or internal addresses.
++denied-peer-ip=0.0.0.0-0.255.255.255
++denied-peer-ip=10.0.0.0-10.255.255.255
++denied-peer-ip=100.64.0.0-100.127.255.255
++denied-peer-ip=127.0.0.0-127.255.255.255
++denied-peer-ip=169.254.0.0-169.254.255.255
++denied-peer-ip=172.16.0.0-172.31.255.255
++denied-peer-ip=192.0.0.0-192.0.0.255
++denied-peer-ip=192.168.0.0-192.168.255.255
++denied-peer-ip=198.18.0.0-198.19.255.255
++denied-peer-ip=::1
++denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
++denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
++
++# ---------- Limits ----------
++# Nothing is limited here: no cap on calls, time or bandwidth. The only limits
++# are your server's own internet speed and your hosting plan's data allowance.
++
++# ---------- Secure turns: (recommended, works through stricter firewalls) ----------
++# Get a free certificate with:  sudo certbot certonly --standalone -d turn.example.com
++# then remove the "#" from the next two lines.
++# cert=/etc/letsencrypt/live/turn.example.com/fullchain.pem
++# pkey=/etc/letsencrypt/live/turn.example.com/privkey.pem
+diff --git a/frontend/.env.example b/frontend/.env.example
+new file mode 100644
+index 0000000..b3d5287
+--- /dev/null
++++ b/frontend/.env.example
+@@ -0,0 +1,8 @@
++# Where the backend is. Change this when the site is hosted online,
++# for example https://api.example.com
++VITE_API_URL=http://localhost:3000
++
++# Test switch for calls: true = every call must go through the TURN relay.
++# If calls still work with this on, your relay is set up correctly.
++# Turn it off (or delete the line) for normal use.
++# VITE_FORCE_RELAY=true
+diff --git a/frontend/src/auth.jsx b/frontend/src/auth.jsx
+index 3842600..e1daae6 100644
+--- a/frontend/src/auth.jsx
++++ b/frontend/src/auth.jsx
+@@ -1,6 +1,6 @@
+ import { useEffect, useState } from "react";
++import { API_URL } from "./config";
+ 
+-const API_URL = "http://localhost:3000";
+ 
+ export function clearSession() {
+   sessionStorage.removeItem("token");
+diff --git a/frontend/src/config.js b/frontend/src/config.js
+new file mode 100644
+index 0000000..29ab05e
+--- /dev/null
++++ b/frontend/src/config.js
+@@ -0,0 +1,9 @@
++// Where the backend lives. Set VITE_API_URL in frontend/.env when the site is
++// hosted online, for example VITE_API_URL=https://api.example.com
++export const API_URL = (
++  import.meta.env.VITE_API_URL || "http://localhost:3000"
++).replace(/\/+$/, "");
++
++// Debug switch: VITE_FORCE_RELAY=true makes every call go through the TURN
++// server. If calls still work, the relay is set up correctly.
++export const FORCE_RELAY = import.meta.env.VITE_FORCE_RELAY === "true";
+diff --git a/frontend/src/ice.js b/frontend/src/ice.js
+new file mode 100644
+index 0000000..6ca19ad
+--- /dev/null
++++ b/frontend/src/ice.js
+@@ -0,0 +1,40 @@
++import { API_URL } from "./config";
++
++// Used when the server can't be reached. Works on the same network and for
++// most home connections, but not through strict firewalls.
++const FALLBACK_SERVERS = [
++  { urls: "stun:stun.l.google.com:19302" },
++  { urls: "stun:stun1.l.google.com:19302" },
++];
++
++let cached = null;
++
++/**
++ * Asks the server which STUN/TURN servers to use. The server hands out
++ * temporary TURN passwords, so nothing secret is stored in the website.
++ */
++export async function loadIceServers() {
++  if (cached && cached.until > Date.now()) return cached.servers;
++
++  try {
++    const response = await fetch(`${API_URL}/ice-servers`, {
++      headers: { Authorization: `Bearer ${sessionStorage.getItem("token")}` },
++      signal: AbortSignal.timeout(4000),
++    });
++
++    if (!response.ok) throw new Error(`Server answered ${response.status}`);
++
++    const data = await response.json();
++
++    // Reuse for a while, but well before the temporary password expires.
++    const keepMs = Math.min((data.ttl || 600) * 500, 60 * 60 * 1000);
++
++    cached = { servers: data.iceServers, until: Date.now() + keepMs };
++
++    return cached.servers;
++  } catch (error) {
++    console.warn("Could not load call servers, using the default:", error);
++
++    return FALLBACK_SERVERS;
++  }
++}
+diff --git a/frontend/src/pages/Chat.jsx b/frontend/src/pages/Chat.jsx
+index 0ea04d7..a5051f1 100644
+--- a/frontend/src/pages/Chat.jsx
++++ b/frontend/src/pages/Chat.jsx
+@@ -14,8 +14,8 @@ import {
+ } from "../components/icons";
+ import { useCall } from "../useCall";
+ import { prepareImage } from "../image";
++import { API_URL } from "../config";
+ 
+-const API_URL = "http://localhost:3000";
+ 
+ /* ---------- Small helpers ---------- */
+ 
+@@ -278,7 +278,7 @@ function Chat() {
+   function markRead(conversationId) {
+     clearUnread(conversationId);
+ 
+-    fetch(`http://localhost:3000/conversations/${conversationId}/read`, {
++    fetch(`${API_URL}/conversations/${conversationId}/read`, {
+       method: "POST",
+       headers: {
+         Authorization: `Bearer ${sessionStorage.getItem("token")}`,
+@@ -315,7 +315,7 @@ function Chat() {
+     try {
+       const token = sessionStorage.getItem("token");
+ 
+-      const response = await fetch("http://localhost:3000/conversations", {
++      const response = await fetch(`${API_URL}/conversations`, {
+         headers: { Authorization: `Bearer ${token}` },
+       });
+ 
+@@ -350,7 +350,7 @@ function Chat() {
+   async function loadIncomingRequests() {
+     try {
+       const response = await fetch(
+-        "http://localhost:3000/message-requests/incoming",
++        `${API_URL}/message-requests/incoming`,
+         {
+           headers: {
+             Authorization: `Bearer ${sessionStorage.getItem("token")}`,
+@@ -419,7 +419,7 @@ function Chat() {
+       return;
+     }
+ 
+-    const newSocket = io("http://localhost:3000", {
++    const newSocket = io(API_URL, {
+       auth: { token },
+     });
+ 
+@@ -620,7 +620,7 @@ function Chat() {
+ 
+     try {
+       const response = await fetch(
+-        `http://localhost:3000/users/search?id=${encodeURIComponent(id)}`,
++        `${API_URL}/users/search?id=${encodeURIComponent(id)}`,
+         {
+           headers: {
+             Authorization: `Bearer ${sessionStorage.getItem("token")}`,
+@@ -657,7 +657,7 @@ function Chat() {
+     setSendingRequest(true);
+ 
+     try {
+-      const response = await fetch("http://localhost:3000/message-requests", {
++      const response = await fetch(`${API_URL}/message-requests`, {
+         method: "POST",
+         headers: {
+           "Content-Type": "application/json",
+@@ -702,7 +702,7 @@ function Chat() {
+ 
+     try {
+       const response = await fetch(
+-        `http://localhost:3000/message-requests/${requestId}/respond`,
++        `${API_URL}/message-requests/${requestId}/respond`,
+         {
+           method: "POST",
+           headers: {
+@@ -786,7 +786,7 @@ function Chat() {
+     setStartingChat(true);
+ 
+     try {
+-      const response = await fetch("http://localhost:3000/conversations", {
++      const response = await fetch(`${API_URL}/conversations`, {
+         method: "POST",
+         headers: {
+           "Content-Type": "application/json",
+@@ -830,7 +830,7 @@ function Chat() {
+     setSettingsError("");
+ 
+     try {
+-      const response = await fetch("http://localhost:3000/settings/history", {
++      const response = await fetch(`${API_URL}/settings/history`, {
+         method: "PATCH",
+         headers: {
+           "Content-Type": "application/json",
+@@ -865,7 +865,7 @@ function Chat() {
+     setPanicError("");
+ 
+     try {
+-      const response = await fetch("http://localhost:3000/messages", {
++      const response = await fetch(`${API_URL}/messages`, {
+         method: "DELETE",
+         headers: {
+           Authorization: `Bearer ${sessionStorage.getItem("token")}`,
+diff --git a/frontend/src/pages/Login.jsx b/frontend/src/pages/Login.jsx
+index 50d1e7d..e81c585 100644
+--- a/frontend/src/pages/Login.jsx
++++ b/frontend/src/pages/Login.jsx
+@@ -1,5 +1,6 @@
+ import { useState } from "react";
+ import { useNavigate } from "react-router-dom";
++import { API_URL } from "../config";
+ 
+ function Login() {
+   const [username, setUsername] = useState("");
+@@ -10,7 +11,7 @@ function Login() {
+ 
+   const handleLogin = async () => {
+     try {
+-      const response = await fetch("http://localhost:3000/login", {
++      const response = await fetch(`${API_URL}/login`, {
+         method: "POST",
+ 
+         headers: {
+diff --git a/frontend/src/pages/Signup.jsx b/frontend/src/pages/Signup.jsx
+index 6258828..dd96e46 100644
+--- a/frontend/src/pages/Signup.jsx
++++ b/frontend/src/pages/Signup.jsx
+@@ -1,5 +1,6 @@
+ import { useState } from "react";
+ import { useNavigate } from "react-router-dom";
++import { API_URL } from "../config";
+ 
+ function Signup() {
+   const [username, setUsername] = useState("");
+@@ -11,7 +12,7 @@ function Signup() {
+ 
+   const handleSignup = async () => {
+     try {
+-      const response = await fetch("http://localhost:3000/signup", {
++      const response = await fetch(`${API_URL}/signup`, {
+         method: "POST",
+ 
+         headers: {
+diff --git a/frontend/src/useCall.js b/frontend/src/useCall.js
+index 0ec953d..bb29e0f 100644
+--- a/frontend/src/useCall.js
++++ b/frontend/src/useCall.js
+@@ -1,11 +1,6 @@
+ import { useCallback, useEffect, useRef, useState } from "react";
+-
+-// STUN helps two browsers find each other. It works on the same network and
+-// most home connections. Some strict networks also need a TURN server.
+-const ICE_SERVERS = [
+-  { urls: "stun:stun.l.google.com:19302" },
+-  { urls: "stun:stun1.l.google.com:19302" },
+-];
++import { FORCE_RELAY } from "./config";
++import { loadIceServers } from "./ice";
+ 
+ const RING_TIMEOUT_MS = 45000;
+ const NOTICE_MS = 4000;
+@@ -168,8 +163,12 @@ export function useCall(socket) {
+   );
+ 
+   const createPeer = useCallback(
+-    (callId) => {
+-      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
++    (callId, iceServers) => {
++      const pc = new RTCPeerConnection({
++        iceServers,
++        // Debug option: only use the TURN relay (see VITE_FORCE_RELAY).
++        iceTransportPolicy: FORCE_RELAY ? "relay" : "all",
++      });
+ 
+       pc.onicecandidate = (event) => {
+         if (event.candidate) sendIce(callId, event.candidate.toJSON());
+@@ -255,7 +254,11 @@ export function useCall(socket) {
+         localStreamRef.current = stream;
+         setLocalStream(stream);
+ 
+-        const pc = createPeer(id);
++        const iceServers = await loadIceServers();
++
++        if (callRef.current?.id !== id) return;
++
++        const pc = createPeer(id, iceServers);
+         pcRef.current = pc;
+ 
+         stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+@@ -304,7 +307,11 @@ export function useCall(socket) {
+       localStreamRef.current = stream;
+       setLocalStream(stream);
+ 
+-      const pc = createPeer(current.id);
++      const iceServers = await loadIceServers();
++
++      if (callRef.current?.id !== current.id) return;
++
++      const pc = createPeer(current.id, iceServers);
+       pcRef.current = pc;
+ 
+       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+@@ -357,6 +364,11 @@ export function useCall(socket) {
+     );
+   }, [updateCall]);
+ 
++  // Fetch the call servers ahead of time so the first call starts quickly.
++  useEffect(() => {
++    if (socket) loadIceServers();
++  }, [socket]);
++
+   /* Messages from the server */
+   useEffect(() => {
+     if (!socket) return;
