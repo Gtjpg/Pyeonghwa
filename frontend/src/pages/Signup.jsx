@@ -26,7 +26,21 @@ function Signup() {
         }),
       });
 
-      const result = await response.json();
+      const raw = await response.text();
+
+console.log("Signup status:", response.status);
+console.log("Signup response:", raw);
+
+let result;
+
+try {
+  result = JSON.parse(raw);
+} catch {
+  setMessage(
+    `Server returned an invalid or empty response (HTTP ${response.status}).`
+  );
+  return;
+}
 
       setMessage(result.message);
 
