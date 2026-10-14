@@ -1,7 +1,7 @@
 // Where the backend lives. Set VITE_API_URL in frontend/.env when the site is
 // hosted online, for example VITE_API_URL=https://api.example.com
 export const API_URL = (
-  import.meta.env.VITE_API_URL || "https://pyeonghwa-1.onrender.com"
+  import.meta.env.VITE_API_URL || "https://pyeonghwa.onrender.com"
 ).replace(/\/+$/, "");
 
 // Debug switch: VITE_FORCE_RELAY=true makes every call go through the TURN
