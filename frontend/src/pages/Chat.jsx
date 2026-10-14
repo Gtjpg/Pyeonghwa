@@ -14,6 +14,7 @@ import {
 } from "../components/icons";
 import { useCall } from "../useCall";
 import { prepareImage } from "../image";
+import { clearPrivateImages, loadPrivateImage } from "../privateImage";
 import { API_URL } from "../config";
 
 
@@ -137,8 +138,26 @@ function playPing() {
 /* ---------- Main component ---------- */
 
 // A photo inside the conversation. Tap it to see it full size.
-function ChatImage({ src, onOpen, onLoaded }) {
+// Photos are private, so they are downloaded with the login token.
+function ChatImage({ path, onOpen, onLoaded }) {
+  const [src, setSrc] = useState(null);
   const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    loadPrivateImage(path)
+      .then((url) => {
+        if (!cancelled) setSrc(url);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [path]);
 
   if (failed) {
     return (
@@ -146,6 +165,10 @@ function ChatImage({ src, onOpen, onLoaded }) {
         This photo is no longer available
       </div>
     );
+  }
+
+  if (!src) {
+    return <div className="h-32 w-48 animate-pulse rounded-2xl bg-slate-800" />;
   }
 
   return (
@@ -211,6 +234,7 @@ function Chat() {
   const navigate = useNavigate();
 
   function logout() {
+    clearPrivateImages();
     clearSession();
     navigate("/", { replace: true });
   }
@@ -566,6 +590,7 @@ function Chat() {
     function handleCleared({ room }) {
       const id = String(room).replace("conversation_", "");
 
+      clearPrivateImages();
       setPreviews((previous) => ({ ...previous, [id]: null }));
       clearUnread(id);
 
@@ -1339,7 +1364,7 @@ function Chat() {
 
                       {msg.message_type === "image" && msg.image_url ? (
                         <ChatImage
-                          src={`${API_URL}${msg.image_url}`}
+                          path={msg.image_url}
                           onOpen={setViewerImage}
                           onLoaded={scrollToBottom}
                         />
@@ -1390,6 +1415,7 @@ function Chat() {
                 <input
                   type="text"
                   placeholder="Write a message..."
+                  maxLength={2000}
                   value={messageInput}
                   onChange={(e) => setMessageInput(e.target.value)}
                   onKeyDown={(e) => {

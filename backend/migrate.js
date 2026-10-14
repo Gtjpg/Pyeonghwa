@@ -155,6 +155,17 @@ async function runMigrations() {
     `);
 
 
+    // 6. Remove empty conversations (no members) that the old
+    //    POST /conversations left behind every time a request was refused.
+    await client.query(`
+      DELETE FROM conversations c
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM conversation_members m
+        WHERE m.conversation_id = c.id
+      )
+    `);
+
     await client.query("COMMIT");
     console.log("Database is up to date");
   } catch (error) {
