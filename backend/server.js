@@ -1,41 +1,17 @@
 const express = require("express");
 const path = require("path");
+const fs = require("fs");
 const crypto = require("crypto");
 const multer = require("multer");
 const bcrypt = require("bcrypt");
-const pool = require("./db"); // also loads backend/.env
-const security = require("./security");
-
-// Refuse to start without a proper JWT_SECRET (the message never shows it).
-try {
-  security.checkConfig();
-} catch (error) {
-  console.error(`Configuration error: ${error.message}`);
-  process.exit(1);
-}
-
-const uploads = require("./uploads");
+const pool = require("./db");
 const { runMigrations } = require("./migrate");
 const http = require("http");
+const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
 const cors = require("cors");
 
 const app = express();
-
-app.disable("x-powered-by");
-
-// Behind a reverse proxy (nginx, Render, Railway...), set TRUST_PROXY=1 so
-// rate limits see each visitor's real address instead of the proxy's.
-if (process.env.TRUST_PROXY) {
-  app.set(
-    "trust proxy",
-    /^\d+$/.test(process.env.TRUST_PROXY)
-      ? Number(process.env.TRUST_PROXY)
-      : process.env.TRUST_PROXY,
-  );
-}
-
-app.use(security.securityHeaders);
 
 // Who may use this server from a browser. Set CLIENT_ORIGIN in .env when the
 // site is hosted somewhere else, for example https://chat.example.com
@@ -53,63 +29,138 @@ app.use(
   }),
 );
 
-app.use(express.json({ limit: "20kb" }));
+app.use(express.json());
 
 app.use(express.static("public"));
 
-/* ---------- Limits ---------- */
-const MAX_MESSAGE_LENGTH = 2000;
-const isObject = (value) =>
-  value !== null && typeof value === "object" && !Array.isArray(value);
+/* ---------- Photo uploads ----------
+   Photos from chats that save history live in uploads/.
+   Photos from chats that don't save history live in uploads/tmp/ and are
+   deleted automatically after an hour. */
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+const TEMP_DIR = path.join(UPLOAD_DIR, "tmp");
+const TEMP_MAX_AGE_MS = 60 * 60 * 1000;
+const IMAGE_URL_PATTERN = /^\/uploads\/(tmp\/)?[a-f0-9]{32}\.(jpg|png|webp)$/;
 
-// Photos are stored privately (see uploads.js) and only served through
-// GET /conversations/:id/images/:name after a membership check.
+fs.mkdirSync(TEMP_DIR, { recursive: true });
+
+app.use(
+  "/uploads",
+  express.static(UPLOAD_DIR, {
+    index: false,
+    dotfiles: "deny",
+    maxAge: "7d",
+    setHeaders: (res) => res.setHeader("X-Content-Type-Options", "nosniff"),
+  }),
+);
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: uploads.MAX_IMAGE_BYTES, files: 1, fields: 4, parts: 6 },
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
 });
 
-const MINUTE = 60 * 1000;
+// Look at the file's first bytes instead of trusting the name or header.
+function detectImageType(buffer) {
+  if (buffer.length < 12) return null;
 
-// Per visitor address
-const loginIpLimiter = security.rateLimit({
-  windowMs: 15 * MINUTE,
-  max: 100,
-  message: "Too many login attempts. Please try again later.",
-});
-const signupLimiter = security.rateLimit({
-  windowMs: 60 * MINUTE,
-  max: 10,
-  message: "Too many sign-ups from this address. Please try again later.",
-});
-// Wrong passwords for one account from one address
-const loginFailures = new security.WindowCounter({
-  windowMs: 15 * MINUTE,
-  max: 10,
-});
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return "jpg";
+  }
 
-// Per logged-in user
-const perUser = (req) => req.user.userId;
-const searchLimiter = security.rateLimit({ windowMs: MINUTE, max: 30, key: perUser });
-const requestLimiter = security.rateLimit({
-  windowMs: 60 * MINUTE,
-  max: 20,
-  key: perUser,
-  message: "You've sent a lot of requests. Please try again later.",
-});
-const uploadLimiter = security.rateLimit({ windowMs: MINUTE, max: 30, key: perUser });
-const imageReadLimiter = security.rateLimit({ windowMs: MINUTE, max: 600, key: perUser });
+  if (
+    buffer.subarray(0, 8).equals(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    )
+  ) {
+    return "png";
+  }
 
-// Per socket user
-const socketLimits = {
-  join: new security.WindowCounter({ windowMs: 10 * 1000, max: 30 }),
-  chat: new security.WindowCounter({ windowMs: 10 * 1000, max: 30 }),
-  invite: new security.WindowCounter({ windowMs: MINUTE, max: 10 }),
-  ice: new security.WindowCounter({ windowMs: MINUTE, max: 300 }),
-};
+  if (
+    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buffer.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "webp";
+  }
 
-// Run once at startup so a missing user takes as long as a wrong password.
-const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString("hex"), 10);
+  return null;
+}
+
+// Only call these with URLs that already passed IMAGE_URL_PATTERN.
+function uploadPath(url) {
+  return path.join(UPLOAD_DIR, url.replace("/uploads/", ""));
+}
+
+function deleteUpload(url) {
+  if (typeof url !== "string" || !IMAGE_URL_PATTERN.test(url)) return;
+
+  fs.promises.unlink(uploadPath(url)).catch(() => {});
+}
+
+// Moves a photo between the saved folder and the temporary one.
+function moveUpload(url, toTemp) {
+  const isTemp = url.startsWith("/uploads/tmp/");
+
+  if (isTemp === toTemp) return url;
+
+  const name = path.basename(url);
+  const newUrl = toTemp ? `/uploads/tmp/${name}` : `/uploads/${name}`;
+
+  fs.renameSync(uploadPath(url), uploadPath(newUrl));
+
+  return newUrl;
+}
+
+function cleanTempUploads() {
+  fs.readdir(TEMP_DIR, (error, files) => {
+    if (error) return;
+
+    const cutoff = Date.now() - TEMP_MAX_AGE_MS;
+
+    for (const file of files) {
+      const filePath = path.join(TEMP_DIR, file);
+
+      fs.stat(filePath, (statError, stats) => {
+        if (!statError && stats.isFile() && stats.mtimeMs < cutoff) {
+          fs.unlink(filePath, () => {});
+        }
+      });
+    }
+  });
+}
+
+cleanTempUploads();
+setInterval(cleanTempUploads, 10 * 60 * 1000).unref();
+
+// Photos that were uploaded but never attached to a message
+// (for example a failed send) are removed after an hour.
+async function cleanOrphanUploads() {
+  try {
+    const entries = await fs.promises.readdir(UPLOAD_DIR, {
+      withFileTypes: true,
+    });
+    const cutoff = Date.now() - TEMP_MAX_AGE_MS;
+
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+
+      const filePath = path.join(UPLOAD_DIR, entry.name);
+      const stats = await fs.promises.stat(filePath);
+
+      if (stats.mtimeMs > cutoff) continue;
+
+      const used = await pool.query(
+        `SELECT 1 FROM messages WHERE image_url = $1 LIMIT 1`,
+        [`/uploads/${entry.name}`],
+      );
+
+      if (used.rows.length === 0) {
+        await fs.promises.unlink(filePath).catch(() => {});
+      }
+    }
+  } catch (error) {
+    console.log("Orphan upload cleanup error:", error);
+  }
+}
 
 const server = http.createServer(app);
 
@@ -118,8 +169,6 @@ const io = new Server(server, {
     origin: CLIENT_ORIGINS,
     methods: ["GET", "POST"],
   },
-  // Messages here are small; this stops oversized payloads.
-  maxHttpBufferSize: 100 * 1024,
 });
 
 io.use((socket, next) => {
@@ -130,9 +179,7 @@ io.use((socket, next) => {
   }
 
   try {
-    const decoded = security.verifyToken(token);
-
-    if (!Number.isInteger(decoded.userId)) throw new Error("Bad token");
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
     socket.userId = decoded.userId;
     socket.username = decoded.username;
@@ -168,7 +215,6 @@ function endCall(callId, reason, exceptSocketId) {
 
   if (!call) return;
 
-  clearTimeout(call.ringTimer);
   calls.delete(callId);
 
   let target = io
@@ -186,17 +232,8 @@ io.on("connection", (socket) => {
   // Personal room so we can notify this user about activity in any of their chats.
   socket.join(`user_${socket.userId}`);
 
-  socket.on("call:invite", async (data) => {
+  socket.on("call:invite", async (data = {}) => {
     try {
-      if (!isObject(data)) return;
-
-      if (!socketLimits.invite.hit(String(socket.userId)).allowed) {
-        return socket.emit("call:ended", {
-          callId: typeof data.callId === "string" ? data.callId : "",
-          reason: "unavailable",
-        });
-      }
-
       const { callId, callType, offer } = data;
       const conversationId = Number(data.conversationId);
 
@@ -237,15 +274,6 @@ io.on("connection", (socket) => {
         return socket.emit("call:ended", { callId, reason: "busy" });
       }
 
-      // Nobody can keep someone's phone ringing (and "busy") forever.
-      const ringTimer = setTimeout(() => {
-        const pending = calls.get(callId);
-
-        if (pending && !pending.answered) endCall(callId, "no_answer");
-      }, 60 * 1000);
-
-      ringTimer.unref();
-
       calls.set(callId, {
         callerId: socket.userId,
         calleeId,
@@ -254,7 +282,6 @@ io.on("connection", (socket) => {
         callerSocketId: socket.id,
         calleeSocketId: null,
         answered: false,
-        ringTimer,
       });
 
       io.to(`user_${calleeId}`).emit("call:incoming", {
@@ -273,9 +300,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("call:answer", (data) => {
-    if (!isObject(data)) return;
-
+  socket.on("call:answer", (data = {}) => {
     const call = calls.get(data.callId);
 
     if (
@@ -290,7 +315,6 @@ io.on("connection", (socket) => {
 
     call.answered = true;
     call.calleeSocketId = socket.id;
-    clearTimeout(call.ringTimer);
 
     // Other tabs of the same person stop ringing.
     socket.to(`user_${call.calleeId}`).emit("call:taken", {
@@ -303,14 +327,10 @@ io.on("connection", (socket) => {
     });
   });
 
-  socket.on("call:ice", (data) => {
-    if (!isObject(data)) return;
-
+  socket.on("call:ice", (data = {}) => {
     const call = calls.get(data.callId);
 
     if (!call || !data.candidate) return;
-
-    if (!socketLimits.ice.hit(String(socket.userId)).allowed) return;
 
     if (JSON.stringify(data.candidate).length > 4000) return;
 
@@ -332,9 +352,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  socket.on("call:end", (data) => {
-    if (!isObject(data)) return;
-
+  socket.on("call:end", (data = {}) => {
     const call = calls.get(data.callId);
 
     if (!call) return;
@@ -367,11 +385,10 @@ io.on("connection", (socket) => {
   socket.on("join_room", async (room) => {
     try {
       // Validate the room name.
-      if (typeof room !== "string" || !/^conversation_\d{1,10}$/.test(room)) {
+      if (typeof room !== "string" || !/^conversation_\d+$/.test(room)) {
+        console.log("Invalid room requested:", room);
         return;
       }
-
-      if (!socketLimits.join.hit(String(socket.userId)).allowed) return;
 
       const conversationId = Number(room.replace("conversation_", ""));
 
@@ -418,13 +435,9 @@ io.on("connection", (socket) => {
     try {
       if (
         typeof data?.room !== "string" ||
-        !/^conversation_\d{1,10}$/.test(data.room)
+        !/^conversation_\d+$/.test(data.room)
       ) {
         return;
-      }
-
-      if (!socketLimits.chat.hit(String(socket.userId)).allowed) {
-        return socket.emit("message_rejected", { reason: "too_fast" });
       }
 
       const conversationId = Number(data.room.replace("conversation_", ""));
@@ -443,7 +456,9 @@ io.on("connection", (socket) => {
       );
 
       if (!isMember) {
-        console.log(`User ${socket.userId} tried to send to a room they are not in`);
+        console.log(
+          `User ${socket.userId} tried to send to unauthorized room ${data.room}`,
+        );
 
         return;
       }
@@ -460,28 +475,19 @@ io.on("connection", (socket) => {
       let content;
 
       if (isImage) {
-        const parsed = uploads.parseImageUrl(data.imageUrl);
-
-        // The photo has to come from THIS conversation's own uploads.
-        if (!parsed || parsed.conversationId !== conversationId) return;
+        if (
+          typeof data.imageUrl !== "string" ||
+          !IMAGE_URL_PATTERN.test(data.imageUrl) ||
+          !fs.existsSync(uploadPath(data.imageUrl))
+        ) {
+          return;
+        }
 
         // Keep the file where the chat's history setting says it belongs.
-        const found = await uploads.relocateImage(
-          conversationId,
-          parsed.name,
-          !keepHistory,
-        );
-
-        if (!found) return;
-
-        imageUrl = data.imageUrl;
+        imageUrl = moveUpload(data.imageUrl, !keepHistory);
         content = "📷 Photo";
       } else {
         if (typeof data.message !== "string" || !data.message.trim()) return;
-
-        if (data.message.length > MAX_MESSAGE_LENGTH) {
-          return socket.emit("message_rejected", { reason: "too_long" });
-        }
 
         content = data.message;
       }
@@ -555,7 +561,9 @@ io.on("connection", (socket) => {
 });
 
 function authenticateToken(req, res, next) {
-  const token = security.readBearerToken(req.headers.authorization);
+  const authHeader = req.headers.authorization;
+
+  const token = authHeader?.split(" ")[1];
 
   if (!token) {
     return res.status(401).json({
@@ -564,9 +572,7 @@ function authenticateToken(req, res, next) {
   }
 
   try {
-    const decoded = security.verifyToken(token);
-
-    if (!Number.isInteger(decoded.userId)) throw new Error("Bad token");
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
     req.user = decoded;
 
@@ -578,33 +584,33 @@ function authenticateToken(req, res, next) {
   }
 }
 
-// For uptime checks. Deliberately shows nothing about the database.
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+app.get("/db-test", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT NOW()");
+
+    res.json({
+      message: "PostgreSQL connected",
+      time: result.rows[0].now,
+    });
+  } catch (error) {
+    console.log(error);
+
+    res.status(500).json({
+      message: "Database connection failed",
+    });
+  }
 });
 
-app.post("/signup", signupLimiter, async (req, res) => {
-  const checked = security.validateSignup(req.body);
+app.post("/signup", async (req, res) => {
+  const { username, email, password } = req.body;
 
-  if (checked.error) {
-    return res.status(400).json({ message: checked.error });
+  if (!username || !email || !password) {
+    return res.status(400).json({
+      message: "Username, email, and password are required",
+    });
   }
 
-  const { username, email, password } = checked.value;
-
   try {
-    // "Alice" and "alice" would look like the same person to others.
-    const taken = await pool.query(
-      `SELECT 1 FROM users WHERE lower(username) = lower($1) OR email = $2 LIMIT 1`,
-      [username, email],
-    );
-
-    if (taken.rows.length > 0) {
-      return res.status(409).json({
-        message: "That username or email is already in use",
-      });
-    }
-
     const passwordHash = await bcrypt.hash(password, 10);
 
     const result = await pool.query(
@@ -621,14 +627,7 @@ app.post("/signup", signupLimiter, async (req, res) => {
       user: result.rows[0],
     });
   } catch (error) {
-    // 23505 = someone else just took it (unique constraint)
-    if (error.code === "23505") {
-      return res.status(409).json({
-        message: "That username or email is already in use",
-      });
-    }
-
-    console.error("Signup error:", error.code || error.message);
+    console.log(error);
 
     res.status(500).json({
       message: "Failed to create account",
@@ -636,60 +635,51 @@ app.post("/signup", signupLimiter, async (req, res) => {
   }
 });
 
-app.post("/login", loginIpLimiter, async (req, res) => {
-  const checked = security.validateLogin(req.body);
+app.post("/login", async (req, res) => {
+  const { username, password } = req.body;
 
-  if (checked.error) {
-    return res.status(400).json({ message: checked.error });
-  }
-
-  const { username, password } = checked.value;
-
-  // Too many wrong passwords for this account from this address.
-  const failKey = `${req.ip}|${username.toLowerCase()}`;
-  const blocked = loginFailures.isBlocked(failKey);
-
-  if (blocked.blocked) {
-    res.setHeader("Retry-After", String(blocked.retryAfter));
-
-    return res.status(429).json({
-      message: "Too many failed attempts. Please try again later.",
+  if (!username || !password) {
+    return res.status(400).json({
+      message: "Username and password are required",
     });
   }
 
   try {
     const result = await pool.query(
       `
-      SELECT id, username, email, public_id, password_hash
+      SELECT *
       FROM users
       WHERE username = $1
       `,
       [username],
     );
 
-    const user = result.rows[0];
-
-    // Always run bcrypt, so an unknown username takes as long as a wrong
-    // password and can't be told apart by timing.
-    const passwordMatches = await bcrypt.compare(
-      password,
-      user ? user.password_hash : DUMMY_HASH,
-    );
-
-    if (!user || !passwordMatches) {
-      loginFailures.hit(failKey);
-
+    if (result.rows.length === 0) {
       return res.status(401).json({
         message: "Invalid username or password",
       });
     }
 
-    loginFailures.reset(failKey);
+    const user = result.rows[0];
 
-    const token = security.signToken({
-      userId: user.id,
-      username: user.username,
-    });
+    const passwordMatches = await bcrypt.compare(password, user.password_hash);
+
+    if (!passwordMatches) {
+      return res.status(401).json({
+        message: "Invalid username or password",
+      });
+    }
+
+    const token = jwt.sign(
+      {
+        userId: user.id,
+        username: user.username,
+      },
+      process.env.JWT_SECRET,
+      {
+        expiresIn: "7d",
+      },
+    );
 
     res.json({
       message: "Login successful",
@@ -702,7 +692,7 @@ app.post("/login", loginIpLimiter, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Login error:", error.code || error.message);
+    console.log(error);
 
     res.status(500).json({
       message: "Login failed",
@@ -787,7 +777,7 @@ app.get("/me", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/users/search", authenticateToken, searchLimiter, async (req, res) => {
+app.get("/users/search", authenticateToken, async (req, res) => {
   // Only an exact ID matches, so nobody can browse or guess through the user list.
   const publicId = String(req.query.id || "")
     .toUpperCase()
@@ -830,11 +820,7 @@ app.get("/users/search", authenticateToken, searchLimiter, async (req, res) => {
   }
 });
 
-app.post(
-  "/message-requests",
-  authenticateToken,
-  requestLimiter,
-  async (req, res) => {
+app.post("/message-requests", authenticateToken, async (req, res) => {
   const senderId = req.user.userId;
   const { targetUserId } = req.body;
   const receiverId = Number(targetUserId);
@@ -849,19 +835,12 @@ app.post(
     return res.status(400).json({
       message: "You cannot send a request to yourself",
     });
-  }
+  } 
 
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
-
-    // Two requests for the same pair of people run one after the other, so a
-    // double-click can't create duplicate pending requests.
-    await client.query("SELECT pg_advisory_xact_lock($1, $2)", [
-      Math.min(senderId, receiverId),
-      Math.max(senderId, receiverId),
-    ]);
 
     // Make sure the target user exists.
     const target = await client.query(`SELECT id FROM users WHERE id = $1`, [
@@ -947,8 +926,8 @@ app.post(
       request,
     });
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    console.error("Send message request error:", error.code || error.message);
+    await client.query("ROLLBACK");
+    console.error("Send message request error:", error);
 
     return res.status(500).json({
       message: "Failed to send message request",
@@ -1069,12 +1048,6 @@ app.post(
         });
       }
 
-      // Serialize per pair so two accepts can't create two conversations.
-      await client.query("SELECT pg_advisory_xact_lock($1, $2)", [
-        Math.min(request.sender_id, request.receiver_id),
-        Math.max(request.sender_id, request.receiver_id),
-      ]);
-
       // Check whether a conversation already exists between these users.
       const existingConversation = await client.query(
         `
@@ -1155,11 +1128,8 @@ app.post(
         ...conversation,
       });
     } catch (error) {
-      await client.query("ROLLBACK").catch(() => {});
-      console.error(
-        "Respond to message request error:",
-        error.code || error.message,
-      );
+      await client.query("ROLLBACK");
+      console.error("Respond to message request error:", error);
 
       return res.status(500).json({
         message: "Failed to respond to message request",
@@ -1170,17 +1140,13 @@ app.post(
   },
 );
 
-// Looks up the conversation you already have with someone. It never creates
-// one: a new conversation only exists once a message request is accepted
-// (POST /message-requests/:id/respond). Because nothing is written here, a
-// refused request can't leave an empty conversation behind.
 app.post("/conversations", authenticateToken, async (req, res) => {
   const currentUserId = req.user.userId;
-  const targetUserId = security.parseId(req.body?.targetUserId);
+  const { targetUserId } = req.body;
 
   if (!targetUserId) {
     return res.status(400).json({
-      message: "A valid target user is required",
+      message: "Target user is required",
     });
   }
 
@@ -1217,15 +1183,22 @@ app.post("/conversations", authenticateToken, async (req, res) => {
       });
     }
 
+    const conversation = await pool.query(
+      `
+        INSERT INTO conversations DEFAULT VALUES
+        RETURNING id
+        `,
+    );
+
     return res.status(403).json({
       message:
         "A message request must be accepted before starting a new conversation",
     });
   } catch (error) {
-    console.error("Conversation error:", error.code || error.message);
+    console.log("Conversation error:", error);
 
     res.status(500).json({
-      message: "Failed to look up the conversation",
+      message: "Failed to create conversation",
     });
   }
 });
@@ -1233,11 +1206,10 @@ app.post("/conversations", authenticateToken, async (req, res) => {
 app.post(
   "/conversations/:id/images",
   authenticateToken,
-  uploadLimiter,
   async (req, res, next) => {
-    const conversationId = security.parseId(req.params.id);
+    const conversationId = Number(req.params.id);
 
-    if (!conversationId) {
+    if (!Number.isInteger(conversationId)) {
       return res.status(400).json({ message: "Invalid conversation" });
     }
 
@@ -1260,11 +1232,10 @@ app.post(
         });
       }
 
-      res.locals.conversationId = conversationId;
       res.locals.keepHistory = result.rows[0].keep_history === true;
       next();
     } catch (error) {
-      console.error("Upload check error:", error.code || error.message);
+      console.log("Upload check error:", error);
 
       res.status(500).json({ message: "Failed to upload photo" });
     }
@@ -1287,8 +1258,7 @@ app.post(
       return res.status(400).json({ message: "No photo was uploaded" });
     }
 
-    // Judged by the file's own bytes, not its name or reported type.
-    const type = uploads.detectImageType(req.file.buffer);
+    const type = detectImageType(req.file.buffer);
 
     if (!type) {
       return res.status(400).json({
@@ -1296,82 +1266,22 @@ app.post(
       });
     }
 
+    const name = `${crypto.randomBytes(16).toString("hex")}.${type}`;
+    const keepHistory = res.locals.keepHistory;
+
     try {
-      const name = await uploads.saveImage(
-        res.locals.conversationId,
+      await fs.promises.writeFile(
+        path.join(keepHistory ? UPLOAD_DIR : TEMP_DIR, name),
         req.file.buffer,
-        type,
-        !res.locals.keepHistory,
       );
 
-      res.json({ url: uploads.imageUrl(res.locals.conversationId, name) });
+      res.json({
+        url: keepHistory ? `/uploads/${name}` : `/uploads/tmp/${name}`,
+      });
     } catch (error) {
-      console.error("Upload save error:", error.code || error.message);
+      console.log("Upload save error:", error);
 
       res.status(500).json({ message: "Failed to save photo" });
-    }
-  },
-);
-
-// The only way to read a photo: you must be logged in AND be a member of the
-// conversation the photo belongs to.
-app.get(
-  "/conversations/:id/images/:name",
-  authenticateToken,
-  imageReadLimiter,
-  async (req, res) => {
-    const conversationId = security.parseId(req.params.id);
-    const name = req.params.name;
-
-    // One answer for a bad address, someone else's conversation and a missing
-    // file, so this can't be used to find out what exists.
-    const notFound = () => res.status(404).json({ message: "Photo not found" });
-
-    if (!conversationId || !uploads.isValidImageName(name)) return notFound();
-
-    try {
-      const membership = await pool.query(
-        `
-        SELECT 1
-        FROM conversation_members
-        WHERE conversation_id = $1
-          AND user_id = $2
-        `,
-        [conversationId, req.user.userId],
-      );
-
-      if (membership.rows.length === 0) return notFound();
-
-      const found = await uploads.findImage(conversationId, name);
-
-      if (!found) return notFound();
-
-      // "root" keeps the file name check separate from the folder path.
-      res.sendFile(
-        path.basename(found.file),
-        {
-          root: path.dirname(found.file),
-          dotfiles: "deny",
-          cacheControl: false,
-          headers: {
-            "Content-Type": uploads.mimeTypeFor(name),
-            "X-Content-Type-Options": "nosniff",
-            "Content-Security-Policy": "default-src 'none'; sandbox",
-            "Content-Disposition": "inline",
-            // Never stored by shared caches; always re-checked with login.
-            "Cache-Control": "private, no-cache",
-          },
-        },
-        (error) => {
-          if (error && !res.headersSent) notFound();
-        },
-      );
-    } catch (error) {
-      console.error("Photo read error:", error.code || error.message);
-
-      if (!res.headersSent) {
-        res.status(500).json({ message: "Failed to load photo" });
-      }
     }
   },
 );
@@ -1520,15 +1430,16 @@ app.delete("/messages", authenticateToken, async (req, res) => {
 
     if (ids.length > 0) {
       const result = await pool.query(
-        `DELETE FROM messages WHERE room = ANY($1::text[])`,
+        `DELETE FROM messages WHERE room = ANY($1::text[]) RETURNING image_url`,
         [rooms],
       );
 
       deleted = result.rowCount;
 
-      // Remove every photo file of these conversations (saved and temporary),
-      // not just the database rows.
-      await uploads.deleteConversationImages(ids);
+      // Remove the saved photo files too, not just the database rows.
+      for (const row of result.rows) {
+        deleteUpload(row.image_url);
+      }
 
       await pool.query(
         `
@@ -1577,50 +1488,18 @@ app.delete("/messages", authenticateToken, async (req, res) => {
   }
 });
 
-// Anything that didn't match a route
-app.use((req, res) => {
-  res.status(404).json({ message: "Not found" });
-});
-
-// Last stop for errors: always JSON, never a stack trace.
-app.use((error, req, res, next) => {
-  if (res.headersSent) return next(error);
-
-  if (error.type === "entity.parse.failed") {
-    return res.status(400).json({ message: "Invalid JSON" });
-  }
-
-  if (error.type === "entity.too.large") {
-    return res.status(413).json({ message: "Request is too large" });
-  }
-
-  console.error("Unhandled error:", error.message);
-
-  res.status(500).json({ message: "Something went wrong" });
-});
-
-process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled promise rejection:", reason?.message || reason);
-});
-
 // Update the database first, then start accepting connections.
 runMigrations()
-  .then(async () => {
-    await uploads.ensureUploadDirs();
-
-    // Photos used to be public. Move them into private storage once.
-    await uploads.migrateLegacyUploads();
-
-    uploads.cleanTempUploads();
-    uploads.cleanOrphanUploads();
-    setInterval(uploads.cleanTempUploads, 10 * 60 * 1000).unref();
-    setInterval(uploads.cleanOrphanUploads, 30 * 60 * 1000).unref();
+  .then(() => {
+    // Needs the database to be up to date first.
+    cleanOrphanUploads();
+    setInterval(cleanOrphanUploads, 30 * 60 * 1000).unref();
 
     server.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
     });
   })
   .catch((error) => {
-    console.error("Startup failed:", error.message);
+    console.error("Database setup failed:", error);
     process.exit(1);
   });

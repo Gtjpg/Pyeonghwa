@@ -1,0 +1,4929 @@
+diff --git a/.gitignore b/.gitignore
+index 0b62d07..1f06970 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -7,3 +7,4 @@ backend/node_modules/
+ dist/
+ coverage/
+ backend/uploads/
++backend/storage/
+diff --git a/SECURITY_REVIEW.md b/SECURITY_REVIEW.md
+new file mode 100644
+index 0000000..52edc6a
+--- /dev/null
++++ b/SECURITY_REVIEW.md
+@@ -0,0 +1,125 @@
++# Pyeonghwa: production-readiness review
++
++Scope: private photos, `POST /conversations`, and a security and reliability
++pass over the existing features. PayMongo was not touched.
++
++## What was found and what changed
++
++### 1. Photos were public
++
++| Problem | Fix |
++| --- | --- |
++| `/uploads/...` was served to anyone who had (or guessed) the link | The public route is removed. Photos live in `UPLOAD_DIR` (default `backend/storage/uploads`), which is outside `backend/public`. The server refuses to start if `UPLOAD_DIR` is inside `public`. |
++| No check on who reads a photo | New `GET /conversations/:id/images/:name`: needs a valid login **and** membership of that conversation. Non-members, missing photos and bad addresses all get the same `404`, so it can't be used to discover what exists. |
++| A photo could be reused in another chat | The conversation id is part of the file path and of the stored address, so a photo can only be read through the conversation it was uploaded to, and the server refuses to attach it to a message in any other conversation. |
++| Path traversal | File names must match `^[a-f0-9]{32}\.(jpg\|png\|webp)$` and ids must be whole numbers. Paths are built only from those, checked to stay inside the storage folder, and resolved with `realpath` so a symbolic link can't point outside it. |
++| File type was checked loosely | The file's own bytes are checked (JPEG marker, PNG `IHDR`, WebP chunk). The name and the type the browser reports are ignored. GIF, SVG, HTML and others are refused. Limit: 5 MB. |
++| Photos could be treated as web pages | Served with a fixed image type, `nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`, `inline`, and `Cache-Control: private, no-cache`. |
++| Frontend used a plain `<img src>` | An `<img>` can't send the login token, so photos are now downloaded with the token (`src/privateImage.js`) and shown from a local address. The loader only ever requests the server's own photo addresses, so the token can't be sent anywhere else. The look of the chat is unchanged. |
++| Panic left files behind | Panic now deletes the whole saved and temporary photo folder of each affected conversation. |
++
++Photos already stored by the old version are moved into private storage when
++the server starts, and their addresses in the database are rewritten.
++
++### 2. `POST /conversations` left empty conversations behind
++
++The handler inserted a new conversation, then always answered `403`, so every
++refused request left a conversation with no members. Now it only **looks up**
++the conversation you already have and never writes anything; a new conversation
++only exists once a message request is accepted. The target id is validated
++(whole positive number only), and empty conversations left over from the old
++behaviour are removed at start-up. Message requests are also serialized per
++pair of people, so a double-click can't create duplicate pending requests.
++
++### 3. Security and reliability
++
++| Area | Found | Changed |
++| --- | --- | --- |
++| Secrets | Server would start with no `JWT_SECRET` | Refuses to start without one; in production also refuses one shorter than 32 characters. Messages never show a value. No secrets are committed (checked the files and git history). |
++| Tokens | Algorithm not pinned; `Bearer` not checked | HS256 only; strict `Bearer <token>`; payload checked. |
++| Debug route | Public `/db-test` | Removed. `/health` shows nothing about the database. |
++| Sign-up | No validation; duplicates gave a 500 | Username, email and password rules (password 8 to 72 bytes); case-insensitive duplicate check; clean `409`. |
++| Login | No type checks; no brute-force limit; unknown users answered faster than wrong passwords | Type checks; lock-out after 10 wrong passwords per account and address; always runs bcrypt so timing doesn't reveal accounts. |
++| Rate limits | None | Login, sign-up, user search, message requests, photo upload and download, plus per-user limits on socket messages, room joins, call invites and ICE messages. |
++| Sockets | Any logged-in user could crash the whole server by sending an empty (`null`) payload to a call event (confirmed against the old code); no message length limit; payloads up to 1 MB | Every event checks its payload; messages max 2000 characters (the input box enforces it too); payloads capped at 100 KB. |
++| Calls | A caller could keep someone "busy" forever | Server-side ring timeout of 60 seconds. |
++| Errors | Invalid JSON returned an HTML error page with a stack trace | Always short JSON; unknown routes return JSON `404`; unhandled rejections are logged. |
++| Headers | None | `nosniff`, `X-Frame-Options`, `Referrer-Policy`, HSTS on https; framework header removed. |
++| Photo upload | Not a member gave `403`, which the app treats as "logged out" | Now `404`. |
++
++SQL: every query is parameterized (no string-built SQL found).
++
++## Upgrading
++
++1. `cd backend && npm install` (adds `multer` and a test-only dependency).
++2. Set `JWT_SECRET` in `backend/.env` to a long random value, for example
++   `openssl rand -hex 32`. **Changing it logs everyone out.**
++3. For production also set `NODE_ENV=production`, `CLIENT_ORIGIN` (your https
++   address) and, behind a reverse proxy, `TRUST_PROXY=1`. Without `TRUST_PROXY`
++   every visitor looks like the proxy and shares one rate-limit allowance.
++4. Optional: `UPLOAD_DIR=/some/private/folder`. Back this folder up together
++   with the database.
++5. Start the server. It moves old photos, deletes old temporary photos, removes
++   empty conversations, and says what it did. Files in the old
++   `backend/uploads` that no message points to are left alone and are no longer
++   served; delete that folder once you've checked the photos load.
++
++Behaviour changes to know about: new accounts need a username of 3 to 30
++letters, numbers, `.`, `-` or `_`, and a password of 8 or more characters.
++Existing accounts are not affected. Photo addresses are now
++`/conversations/<id>/images/<name>`. Anything that called `/db-test` or
++`/uploads/...` directly must change.
++
++## Tests
++
++```
++cd backend && npm test        # 84 tests
++cd frontend && npm test       # 10 tests
++```
++
++The backend integration tests start the real server and need PostgreSQL (the
++database in `backend/.env`, or set `TEST_DB_NAME`). They only create users
++named `zt<random>...` and remove everything they made, but running them
++against a throwaway database is still the safest. They are skipped with a
++message if PostgreSQL isn't reachable. They cover: private photo access for
++members, non-members and logged-out requests, path traversal, file type and
++size limits, moving old photos, the panic button, conversation creation (no
++leftovers, including 25 requests at once), message request permissions and
++races, sign-up and login rules, lock-out, token forgery, error responses,
++headers, CORS, socket abuse and start-up checks. Each key test was also
++checked by putting the old bug back and confirming the test fails.
++
++## Remaining risks
++
++Not fixed, and worth knowing about before going live:
++
++1. **Login token lives in `sessionStorage` and lasts 7 days.** A cross-site
++   scripting bug would expose it, and there is no server-side log-out or
++   revocation. The server doesn't re-check that the account still exists on each
++   request. (React escapes message text, and no `innerHTML` is used.)
++2. **Rate limits and call state are kept in memory.** They reset when the server
++   restarts and are per process. Running several server copies needs a shared
++   store such as Redis.
++3. **Photo storage.** Photos are not encrypted at rest, not scanned for malware,
++   and not re-encoded on the server (the web app re-encodes before upload, but a
++   custom client could upload a JPEG with location data). There is no storage
++   quota per user. Several servers need shared storage. Use an encrypted disk
++   and file permissions.
++4. **Panic and "Save chat history" affect both people** in a conversation by
++   design, so one person can erase the other's messages.
++5. **Joining a chat loads the whole history.** Very long chats will be slow;
++   there is no paging.
++6. **Accounts.** No email verification, password reset or two-factor login.
++   Message requests can still be repeated up to the rate limit; there is no
++   block or report.
++7. **HTTPS is not handled by this app.** Put it behind a reverse proxy that
++   provides it.
++8. **The old pages in `backend/public`** (including a copy of the chat source)
++   are still served. Remove that folder for production.
++9. **Operations.** bcrypt cost is 10 (raise to 12 if your server allows). The
++   base database tables aren't defined in the repository, and there is no
++   migration tool beyond `migrate.js`. There is no audit log or monitoring.
++10. **Testing limits.** Tests ran against a database whose base tables I
++    recreated from the queries in the code, and without a real browser,
++    camera, microphone or phone. Try the photo and call flows once on your own
++    setup.
+diff --git a/backend/.env.example b/backend/.env.example
+index d98510a..5661ca0 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -6,12 +6,27 @@ DB_USER=postgres
+ DB_PASSWORD=change-me
+ 
+ # ---------- Login tokens ----------
+-JWT_SECRET=use-a-long-random-string
++# Required. At least 32 random characters, for example the output of:
++#   openssl rand -hex 32
++# The server will not start without it. Never share it or commit it.
++JWT_SECRET=
+ 
+ # ---------- Server ----------
+ PORT=3000
+ # The address people open the website at. Use https:// when it is hosted online.
+ CLIENT_ORIGIN=http://localhost:5173
++# Set to production when the site is live. The server then refuses to start
++# with a short JWT_SECRET.
++# NODE_ENV=production
++# Behind a reverse proxy (nginx, Render, Railway...)? Set the number of
++# proxies (usually 1) so rate limits see each visitor's real address.
++# TRUST_PROXY=1
++
++# ---------- Private photo storage ----------
++# Where photos are kept. Must NOT be inside backend/public. Photos are only
++# served through the login-protected /conversations/:id/images/:name address.
++# Default: backend/storage/uploads
++# UPLOAD_DIR=/var/lib/pyeonghwa/uploads
+ 
+ # ---------- Calls across different networks (TURN relay) ----------
+ # See TURN_SETUP.md. Leave these empty to use direct calls only.
+diff --git a/backend/migrate.js b/backend/migrate.js
+index 4aa7093..adf5efd 100644
+--- a/backend/migrate.js
++++ b/backend/migrate.js
+@@ -155,6 +155,17 @@ async function runMigrations() {
+     `);
+ 
+ 
++    // 6. Remove empty conversations (no members) that the old
++    //    POST /conversations left behind every time a request was refused.
++    await client.query(`
++      DELETE FROM conversations c
++      WHERE NOT EXISTS (
++        SELECT 1
++        FROM conversation_members m
++        WHERE m.conversation_id = c.id
++      )
++    `);
++
+     await client.query("COMMIT");
+     console.log("Database is up to date");
+   } catch (error) {
+diff --git a/backend/package-lock.json b/backend/package-lock.json
+index cc8367b..03de221 100644
+--- a/backend/package-lock.json
++++ b/backend/package-lock.json
+@@ -17,6 +17,9 @@
+         "multer": "^2.4.0",
+         "pg": "^8.23.1",
+         "socket.io": "^4.8.4"
++      },
++      "devDependencies": {
++        "socket.io-client": "^4.8.4"
+       }
+     },
+     "node_modules/@socket.io/component-emitter": {
+@@ -333,6 +336,20 @@
+         "node": ">=10.2.0"
+       }
+     },
++    "node_modules/engine.io-client": {
++      "version": "6.6.7",
++      "resolved": "https://registry.npmjs.org/engine.io-client/-/engine.io-client-6.6.7.tgz",
++      "integrity": "sha512-GyAvmPA7gnRCpDQbYACAy79Lg4ewevrmaPzySZz0OVvgyZc3gEfLLqPTYk8wVBScjOEpM9ZO4KryyFpVItjGEA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@socket.io/component-emitter": "~3.1.0",
++        "debug": "~4.4.1",
++        "engine.io-parser": "~5.2.1",
++        "ws": "~8.21.0",
++        "xmlhttprequest-ssl": "~2.1.1"
++      }
++    },
+     "node_modules/engine.io-parser": {
+       "version": "5.2.3",
+       "resolved": "https://registry.npmjs.org/engine.io-parser/-/engine.io-parser-5.2.3.tgz",
+@@ -1365,6 +1382,22 @@
+         "ws": "~8.21.0"
+       }
+     },
++    "node_modules/socket.io-client": {
++      "version": "4.8.4",
++      "resolved": "https://registry.npmjs.org/socket.io-client/-/socket.io-client-4.8.4.tgz",
++      "integrity": "sha512-7wjKAvVXYOJsbmUgkWbnhPD4bFpkqrUR0++XOjpGFmqDqsqV1CI93VTraeExLxpjxEqrWgFoSRZu1ihjLWfkAA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@socket.io/component-emitter": "~3.1.0",
++        "debug": "~4.4.1",
++        "engine.io-client": "~6.6.1",
++        "socket.io-parser": "~4.2.4"
++      },
++      "engines": {
++        "node": ">=10.0.0"
++      }
++    },
+     "node_modules/socket.io-parser": {
+       "version": "4.2.7",
+       "resolved": "https://registry.npmjs.org/socket.io-parser/-/socket.io-parser-4.2.7.tgz",
+@@ -1538,6 +1571,15 @@
+         }
+       }
+     },
++    "node_modules/xmlhttprequest-ssl": {
++      "version": "2.1.2",
++      "resolved": "https://registry.npmjs.org/xmlhttprequest-ssl/-/xmlhttprequest-ssl-2.1.2.tgz",
++      "integrity": "sha512-TEU+nJVUUnA4CYJFLvK5X9AOeH4KvDvhIfm0vV1GaQRtchnG0hgK5p8hw/xjv8cunWYCsiPCSDzObPyhEwq3KQ==",
++      "dev": true,
++      "engines": {
++        "node": ">=0.4.0"
++      }
++    },
+     "node_modules/xtend": {
+       "version": "4.0.2",
+       "resolved": "https://registry.npmjs.org/xtend/-/xtend-4.0.2.tgz",
+diff --git a/backend/package.json b/backend/package.json
+index 4377ac9..42571d7 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -4,7 +4,7 @@
+   "description": "",
+   "main": "index.js",
+   "scripts": {
+-    "test": "echo \"Error: no test specified\" && exit 1",
++    "test": "node --test",
+     "dev": "node --watch server.js"
+   },
+   "keywords": [],
+@@ -20,5 +20,8 @@
+     "multer": "^2.4.0",
+     "pg": "^8.23.1",
+     "socket.io": "^4.8.4"
++  },
++  "devDependencies": {
++    "socket.io-client": "^4.8.4"
+   }
+ }
+diff --git a/backend/security.js b/backend/security.js
+new file mode 100644
+index 0000000..6f64f3e
+--- /dev/null
++++ b/backend/security.js
+@@ -0,0 +1,241 @@
++/**
++ * Security helpers: startup checks, login tokens, rate limits and input checks.
++ * Nothing in here ever logs or returns a secret.
++ */
++const jwt = require("jsonwebtoken");
++
++/* ---------- Startup checks ---------- */
++
++// Stops the server from starting half-configured. Messages name the setting,
++// never its value.
++function checkConfig(env = process.env) {
++  if (!env.JWT_SECRET) {
++    throw new Error(
++      "JWT_SECRET is not set. Add a long random value to backend/.env " +
++        "(for example the output of: openssl rand -hex 32).",
++    );
++  }
++
++  if (env.JWT_SECRET.length < 32) {
++    const message = "JWT_SECRET is shorter than 32 characters.";
++
++    if (env.NODE_ENV === "production") {
++      throw new Error(`${message} Use a long random value in production.`);
++    }
++
++    console.warn(`Warning: ${message} Use a longer one before going live.`);
++  }
++
++  if (env.NODE_ENV === "production") {
++    const origins = (env.CLIENT_ORIGIN || "").split(",").map((o) => o.trim());
++
++    if (origins.some((origin) => origin && !origin.startsWith("https://"))) {
++      console.warn(
++        "Warning: CLIENT_ORIGIN contains a non-https address. Use https in production.",
++      );
++    }
++  }
++}
++
++/* ---------- Login tokens ---------- */
++
++// The algorithm is pinned so a token can't pick a weaker one ("none" etc.).
++function signToken(payload) {
++  return jwt.sign(payload, process.env.JWT_SECRET, {
++    algorithm: "HS256",
++    expiresIn: "7d",
++  });
++}
++
++function verifyToken(token) {
++  return jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
++}
++
++// "Bearer <token>" -> "<token>", anything else -> null
++function readBearerToken(header) {
++  if (typeof header !== "string") return null;
++
++  const match = /^Bearer\s+(\S+)$/i.exec(header.trim());
++
++  return match ? match[1] : null;
++}
++
++/* ---------- Rate limits (in memory, per server process) ---------- */
++
++class WindowCounter {
++  constructor({ windowMs, max }) {
++    this.windowMs = windowMs;
++    this.max = max;
++    this.entries = new Map();
++
++    const timer = setInterval(() => this.sweep(), Math.max(windowMs, 60000));
++    timer.unref();
++  }
++
++  sweep() {
++    const now = Date.now();
++
++    for (const [key, entry] of this.entries) {
++      if (entry.reset <= now) this.entries.delete(key);
++    }
++  }
++
++  // Counts one attempt for this key.
++  hit(key) {
++    const now = Date.now();
++    let entry = this.entries.get(key);
++
++    if (!entry || entry.reset <= now) {
++      // Keep memory bounded if someone floods with different keys.
++      if (this.entries.size >= 50000) {
++        this.entries.delete(this.entries.keys().next().value);
++      }
++
++      entry = { count: 0, reset: now + this.windowMs };
++      this.entries.set(key, entry);
++    }
++
++    entry.count += 1;
++
++    return {
++      allowed: entry.count <= this.max,
++      retryAfter: Math.max(1, Math.ceil((entry.reset - now) / 1000)),
++    };
++  }
++
++  // Is this key already over the limit? (does not count an attempt)
++  isBlocked(key) {
++    const entry = this.entries.get(key);
++
++    return {
++      blocked: !!entry && entry.reset > Date.now() && entry.count >= this.max,
++      retryAfter: entry
++        ? Math.max(1, Math.ceil((entry.reset - Date.now()) / 1000))
++        : 0,
++    };
++  }
++
++  reset(key) {
++    this.entries.delete(key);
++  }
++}
++
++function rateLimit({ windowMs, max, key = (req) => req.ip, message }) {
++  const counter = new WindowCounter({ windowMs, max });
++
++  return (req, res, next) => {
++    const result = counter.hit(String(key(req)));
++
++    if (result.allowed) return next();
++
++    res.setHeader("Retry-After", String(result.retryAfter));
++
++    return res.status(429).json({
++      message: message || "Too many requests. Please try again later.",
++    });
++  };
++}
++
++/* ---------- Security headers ---------- */
++
++function securityHeaders(req, res, next) {
++  res.setHeader("X-Content-Type-Options", "nosniff");
++  res.setHeader("X-Frame-Options", "DENY");
++  res.setHeader("Referrer-Policy", "no-referrer");
++
++  if (req.secure) {
++    res.setHeader("Strict-Transport-Security", "max-age=15552000");
++  }
++
++  next();
++}
++
++/* ---------- Input checks ---------- */
++
++const USERNAME_PATTERN = /^[A-Za-z0-9_.-]{3,30}$/;
++const EMAIL_PATTERN = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
++
++// bcrypt only uses the first 72 bytes, so longer passwords are refused
++// instead of being silently cut.
++function validateSignup(body) {
++  const { username, email, password } = body || {};
++
++  if (
++    typeof username !== "string" ||
++    typeof email !== "string" ||
++    typeof password !== "string" ||
++    !username ||
++    !email ||
++    !password
++  ) {
++    return { error: "Username, email, and password are required" };
++  }
++
++  if (!USERNAME_PATTERN.test(username)) {
++    return {
++      error:
++        "Username must be 3 to 30 characters: letters, numbers, dots, dashes or underscores",
++    };
++  }
++
++  const cleanEmail = email.trim().toLowerCase();
++
++  if (cleanEmail.length > 254 || !EMAIL_PATTERN.test(cleanEmail)) {
++    return { error: "Enter a valid email address" };
++  }
++
++  if (password.length < 8) {
++    return { error: "Password must be at least 8 characters" };
++  }
++
++  if (Buffer.byteLength(password, "utf8") > 72) {
++    return { error: "Password must be 72 bytes or fewer" };
++  }
++
++  return { value: { username, email: cleanEmail, password } };
++}
++
++function validateLogin(body) {
++  const { username, password } = body || {};
++
++  if (
++    typeof username !== "string" ||
++    typeof password !== "string" ||
++    !username ||
++    !password
++  ) {
++    return { error: "Username and password are required" };
++  }
++
++  if (username.length > 100 || password.length > 200) {
++    return { error: "Invalid username or password" };
++  }
++
++  return { value: { username, password } };
++}
++
++// A positive whole number, given as a number or as digits in a string.
++// Anything else (arrays, objects, "1e3", "0x10", " 5 ") is rejected.
++function parseId(value) {
++  const isNumber = typeof value === "number";
++  const isDigits = typeof value === "string" && /^[0-9]{1,10}$/.test(value);
++
++  if (!isNumber && !isDigits) return null;
++
++  const id = Number(value);
++
++  return Number.isSafeInteger(id) && id > 0 && id <= 2147483647 ? id : null;
++}
++
++module.exports = {
++  checkConfig,
++  signToken,
++  verifyToken,
++  readBearerToken,
++  WindowCounter,
++  rateLimit,
++  securityHeaders,
++  validateSignup,
++  validateLogin,
++  parseId,
++};
+diff --git a/backend/server.js b/backend/server.js
+index 517d293..822d14c 100644
+--- a/backend/server.js
++++ b/backend/server.js
+@@ -1,18 +1,42 @@
+ const express = require("express");
+ const path = require("path");
+-const fs = require("fs");
+ const crypto = require("crypto");
+ const multer = require("multer");
+ const bcrypt = require("bcrypt");
+-const pool = require("./db");
++const pool = require("./db"); // also loads backend/.env
++const security = require("./security");
++
++// Refuse to start without a proper JWT_SECRET (the message never shows it).
++try {
++  security.checkConfig();
++} catch (error) {
++  console.error(`Configuration error: ${error.message}`);
++  process.exit(1);
++}
++
++const uploads = require("./uploads");
+ const { runMigrations } = require("./migrate");
+ const http = require("http");
+-const jwt = require("jsonwebtoken");
+ const { Server } = require("socket.io");
+ const cors = require("cors");
+ 
+ const app = express();
+ 
++app.disable("x-powered-by");
++
++// Behind a reverse proxy (nginx, Render, Railway...), set TRUST_PROXY=1 so
++// rate limits see each visitor's real address instead of the proxy's.
++if (process.env.TRUST_PROXY) {
++  app.set(
++    "trust proxy",
++    /^\d+$/.test(process.env.TRUST_PROXY)
++      ? Number(process.env.TRUST_PROXY)
++      : process.env.TRUST_PROXY,
++  );
++}
++
++app.use(security.securityHeaders);
++
+ // Who may use this server from a browser. Set CLIENT_ORIGIN in .env when the
+ // site is hosted somewhere else, for example https://chat.example.com
+ // (several addresses can be separated with commas).
+@@ -29,138 +53,63 @@ app.use(
+   }),
+ );
+ 
+-app.use(express.json());
++app.use(express.json({ limit: "20kb" }));
+ 
+ app.use(express.static("public"));
+ 
+-/* ---------- Photo uploads ----------
+-   Photos from chats that save history live in uploads/.
+-   Photos from chats that don't save history live in uploads/tmp/ and are
+-   deleted automatically after an hour. */
+-const UPLOAD_DIR = path.join(__dirname, "uploads");
+-const TEMP_DIR = path.join(UPLOAD_DIR, "tmp");
+-const TEMP_MAX_AGE_MS = 60 * 60 * 1000;
+-const IMAGE_URL_PATTERN = /^\/uploads\/(tmp\/)?[a-f0-9]{32}\.(jpg|png|webp)$/;
+-
+-fs.mkdirSync(TEMP_DIR, { recursive: true });
+-
+-app.use(
+-  "/uploads",
+-  express.static(UPLOAD_DIR, {
+-    index: false,
+-    dotfiles: "deny",
+-    maxAge: "7d",
+-    setHeaders: (res) => res.setHeader("X-Content-Type-Options", "nosniff"),
+-  }),
+-);
++/* ---------- Limits ---------- */
++const MAX_MESSAGE_LENGTH = 2000;
++const isObject = (value) =>
++  value !== null && typeof value === "object" && !Array.isArray(value);
+ 
++// Photos are stored privately (see uploads.js) and only served through
++// GET /conversations/:id/images/:name after a membership check.
+ const upload = multer({
+   storage: multer.memoryStorage(),
+-  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
++  limits: { fileSize: uploads.MAX_IMAGE_BYTES, files: 1, fields: 4, parts: 6 },
+ });
+ 
+-// Look at the file's first bytes instead of trusting the name or header.
+-function detectImageType(buffer) {
+-  if (buffer.length < 12) return null;
+-
+-  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+-    return "jpg";
+-  }
+-
+-  if (
+-    buffer.subarray(0, 8).equals(
+-      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+-    )
+-  ) {
+-    return "png";
+-  }
+-
+-  if (
+-    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+-    buffer.subarray(8, 12).toString("ascii") === "WEBP"
+-  ) {
+-    return "webp";
+-  }
+-
+-  return null;
+-}
+-
+-// Only call these with URLs that already passed IMAGE_URL_PATTERN.
+-function uploadPath(url) {
+-  return path.join(UPLOAD_DIR, url.replace("/uploads/", ""));
+-}
+-
+-function deleteUpload(url) {
+-  if (typeof url !== "string" || !IMAGE_URL_PATTERN.test(url)) return;
+-
+-  fs.promises.unlink(uploadPath(url)).catch(() => {});
+-}
++const MINUTE = 60 * 1000;
+ 
+-// Moves a photo between the saved folder and the temporary one.
+-function moveUpload(url, toTemp) {
+-  const isTemp = url.startsWith("/uploads/tmp/");
+-
+-  if (isTemp === toTemp) return url;
+-
+-  const name = path.basename(url);
+-  const newUrl = toTemp ? `/uploads/tmp/${name}` : `/uploads/${name}`;
+-
+-  fs.renameSync(uploadPath(url), uploadPath(newUrl));
+-
+-  return newUrl;
+-}
+-
+-function cleanTempUploads() {
+-  fs.readdir(TEMP_DIR, (error, files) => {
+-    if (error) return;
+-
+-    const cutoff = Date.now() - TEMP_MAX_AGE_MS;
+-
+-    for (const file of files) {
+-      const filePath = path.join(TEMP_DIR, file);
+-
+-      fs.stat(filePath, (statError, stats) => {
+-        if (!statError && stats.isFile() && stats.mtimeMs < cutoff) {
+-          fs.unlink(filePath, () => {});
+-        }
+-      });
+-    }
+-  });
+-}
+-
+-cleanTempUploads();
+-setInterval(cleanTempUploads, 10 * 60 * 1000).unref();
+-
+-// Photos that were uploaded but never attached to a message
+-// (for example a failed send) are removed after an hour.
+-async function cleanOrphanUploads() {
+-  try {
+-    const entries = await fs.promises.readdir(UPLOAD_DIR, {
+-      withFileTypes: true,
+-    });
+-    const cutoff = Date.now() - TEMP_MAX_AGE_MS;
+-
+-    for (const entry of entries) {
+-      if (!entry.isFile()) continue;
+-
+-      const filePath = path.join(UPLOAD_DIR, entry.name);
+-      const stats = await fs.promises.stat(filePath);
++// Per visitor address
++const loginIpLimiter = security.rateLimit({
++  windowMs: 15 * MINUTE,
++  max: 100,
++  message: "Too many login attempts. Please try again later.",
++});
++const signupLimiter = security.rateLimit({
++  windowMs: 60 * MINUTE,
++  max: 10,
++  message: "Too many sign-ups from this address. Please try again later.",
++});
++// Wrong passwords for one account from one address
++const loginFailures = new security.WindowCounter({
++  windowMs: 15 * MINUTE,
++  max: 10,
++});
+ 
+-      if (stats.mtimeMs > cutoff) continue;
++// Per logged-in user
++const perUser = (req) => req.user.userId;
++const searchLimiter = security.rateLimit({ windowMs: MINUTE, max: 30, key: perUser });
++const requestLimiter = security.rateLimit({
++  windowMs: 60 * MINUTE,
++  max: 20,
++  key: perUser,
++  message: "You've sent a lot of requests. Please try again later.",
++});
++const uploadLimiter = security.rateLimit({ windowMs: MINUTE, max: 30, key: perUser });
++const imageReadLimiter = security.rateLimit({ windowMs: MINUTE, max: 600, key: perUser });
+ 
+-      const used = await pool.query(
+-        `SELECT 1 FROM messages WHERE image_url = $1 LIMIT 1`,
+-        [`/uploads/${entry.name}`],
+-      );
++// Per socket user
++const socketLimits = {
++  join: new security.WindowCounter({ windowMs: 10 * 1000, max: 30 }),
++  chat: new security.WindowCounter({ windowMs: 10 * 1000, max: 30 }),
++  invite: new security.WindowCounter({ windowMs: MINUTE, max: 10 }),
++  ice: new security.WindowCounter({ windowMs: MINUTE, max: 300 }),
++};
+ 
+-      if (used.rows.length === 0) {
+-        await fs.promises.unlink(filePath).catch(() => {});
+-      }
+-    }
+-  } catch (error) {
+-    console.log("Orphan upload cleanup error:", error);
+-  }
+-}
++// Run once at startup so a missing user takes as long as a wrong password.
++const DUMMY_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString("hex"), 10);
+ 
+ const server = http.createServer(app);
+ 
+@@ -169,6 +118,8 @@ const io = new Server(server, {
+     origin: CLIENT_ORIGINS,
+     methods: ["GET", "POST"],
+   },
++  // Messages here are small; this stops oversized payloads.
++  maxHttpBufferSize: 100 * 1024,
+ });
+ 
+ io.use((socket, next) => {
+@@ -179,7 +130,9 @@ io.use((socket, next) => {
+   }
+ 
+   try {
+-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
++    const decoded = security.verifyToken(token);
++
++    if (!Number.isInteger(decoded.userId)) throw new Error("Bad token");
+ 
+     socket.userId = decoded.userId;
+     socket.username = decoded.username;
+@@ -215,6 +168,7 @@ function endCall(callId, reason, exceptSocketId) {
+ 
+   if (!call) return;
+ 
++  clearTimeout(call.ringTimer);
+   calls.delete(callId);
+ 
+   let target = io
+@@ -232,8 +186,17 @@ io.on("connection", (socket) => {
+   // Personal room so we can notify this user about activity in any of their chats.
+   socket.join(`user_${socket.userId}`);
+ 
+-  socket.on("call:invite", async (data = {}) => {
++  socket.on("call:invite", async (data) => {
+     try {
++      if (!isObject(data)) return;
++
++      if (!socketLimits.invite.hit(String(socket.userId)).allowed) {
++        return socket.emit("call:ended", {
++          callId: typeof data.callId === "string" ? data.callId : "",
++          reason: "unavailable",
++        });
++      }
++
+       const { callId, callType, offer } = data;
+       const conversationId = Number(data.conversationId);
+ 
+@@ -274,6 +237,15 @@ io.on("connection", (socket) => {
+         return socket.emit("call:ended", { callId, reason: "busy" });
+       }
+ 
++      // Nobody can keep someone's phone ringing (and "busy") forever.
++      const ringTimer = setTimeout(() => {
++        const pending = calls.get(callId);
++
++        if (pending && !pending.answered) endCall(callId, "no_answer");
++      }, 60 * 1000);
++
++      ringTimer.unref();
++
+       calls.set(callId, {
+         callerId: socket.userId,
+         calleeId,
+@@ -282,6 +254,7 @@ io.on("connection", (socket) => {
+         callerSocketId: socket.id,
+         calleeSocketId: null,
+         answered: false,
++        ringTimer,
+       });
+ 
+       io.to(`user_${calleeId}`).emit("call:incoming", {
+@@ -300,7 +273,9 @@ io.on("connection", (socket) => {
+     }
+   });
+ 
+-  socket.on("call:answer", (data = {}) => {
++  socket.on("call:answer", (data) => {
++    if (!isObject(data)) return;
++
+     const call = calls.get(data.callId);
+ 
+     if (
+@@ -315,6 +290,7 @@ io.on("connection", (socket) => {
+ 
+     call.answered = true;
+     call.calleeSocketId = socket.id;
++    clearTimeout(call.ringTimer);
+ 
+     // Other tabs of the same person stop ringing.
+     socket.to(`user_${call.calleeId}`).emit("call:taken", {
+@@ -327,11 +303,15 @@ io.on("connection", (socket) => {
+     });
+   });
+ 
+-  socket.on("call:ice", (data = {}) => {
++  socket.on("call:ice", (data) => {
++    if (!isObject(data)) return;
++
+     const call = calls.get(data.callId);
+ 
+     if (!call || !data.candidate) return;
+ 
++    if (!socketLimits.ice.hit(String(socket.userId)).allowed) return;
++
+     if (JSON.stringify(data.candidate).length > 4000) return;
+ 
+     let target = null;
+@@ -352,7 +332,9 @@ io.on("connection", (socket) => {
+     });
+   });
+ 
+-  socket.on("call:end", (data = {}) => {
++  socket.on("call:end", (data) => {
++    if (!isObject(data)) return;
++
+     const call = calls.get(data.callId);
+ 
+     if (!call) return;
+@@ -385,11 +367,12 @@ io.on("connection", (socket) => {
+   socket.on("join_room", async (room) => {
+     try {
+       // Validate the room name.
+-      if (typeof room !== "string" || !/^conversation_\d+$/.test(room)) {
+-        console.log("Invalid room requested:", room);
++      if (typeof room !== "string" || !/^conversation_\d{1,10}$/.test(room)) {
+         return;
+       }
+ 
++      if (!socketLimits.join.hit(String(socket.userId)).allowed) return;
++
+       const conversationId = Number(room.replace("conversation_", ""));
+ 
+       // Check whether this user belongs to the conversation.
+@@ -435,11 +418,15 @@ io.on("connection", (socket) => {
+     try {
+       if (
+         typeof data?.room !== "string" ||
+-        !/^conversation_\d+$/.test(data.room)
++        !/^conversation_\d{1,10}$/.test(data.room)
+       ) {
+         return;
+       }
+ 
++      if (!socketLimits.chat.hit(String(socket.userId)).allowed) {
++        return socket.emit("message_rejected", { reason: "too_fast" });
++      }
++
+       const conversationId = Number(data.room.replace("conversation_", ""));
+ 
+       const members = await pool.query(
+@@ -456,9 +443,7 @@ io.on("connection", (socket) => {
+       );
+ 
+       if (!isMember) {
+-        console.log(
+-          `User ${socket.userId} tried to send to unauthorized room ${data.room}`,
+-        );
++        console.log(`User ${socket.userId} tried to send to a room they are not in`);
+ 
+         return;
+       }
+@@ -475,20 +460,29 @@ io.on("connection", (socket) => {
+       let content;
+ 
+       if (isImage) {
+-        if (
+-          typeof data.imageUrl !== "string" ||
+-          !IMAGE_URL_PATTERN.test(data.imageUrl) ||
+-          !fs.existsSync(uploadPath(data.imageUrl))
+-        ) {
+-          return;
+-        }
++        const parsed = uploads.parseImageUrl(data.imageUrl);
++
++        // The photo has to come from THIS conversation's own uploads.
++        if (!parsed || parsed.conversationId !== conversationId) return;
+ 
+         // Keep the file where the chat's history setting says it belongs.
+-        imageUrl = moveUpload(data.imageUrl, !keepHistory);
++        const found = await uploads.relocateImage(
++          conversationId,
++          parsed.name,
++          !keepHistory,
++        );
++
++        if (!found) return;
++
++        imageUrl = data.imageUrl;
+         content = "📷 Photo";
+       } else {
+         if (typeof data.message !== "string" || !data.message.trim()) return;
+ 
++        if (data.message.length > MAX_MESSAGE_LENGTH) {
++          return socket.emit("message_rejected", { reason: "too_long" });
++        }
++
+         content = data.message;
+       }
+ 
+@@ -561,9 +555,7 @@ io.on("connection", (socket) => {
+ });
+ 
+ function authenticateToken(req, res, next) {
+-  const authHeader = req.headers.authorization;
+-
+-  const token = authHeader?.split(" ")[1];
++  const token = security.readBearerToken(req.headers.authorization);
+ 
+   if (!token) {
+     return res.status(401).json({
+@@ -572,7 +564,9 @@ function authenticateToken(req, res, next) {
+   }
+ 
+   try {
+-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
++    const decoded = security.verifyToken(token);
++
++    if (!Number.isInteger(decoded.userId)) throw new Error("Bad token");
+ 
+     req.user = decoded;
+ 
+@@ -584,33 +578,33 @@ function authenticateToken(req, res, next) {
+   }
+ }
+ 
+-app.get("/db-test", async (req, res) => {
+-  try {
+-    const result = await pool.query("SELECT NOW()");
+-
+-    res.json({
+-      message: "PostgreSQL connected",
+-      time: result.rows[0].now,
+-    });
+-  } catch (error) {
+-    console.log(error);
+-
+-    res.status(500).json({
+-      message: "Database connection failed",
+-    });
+-  }
++// For uptime checks. Deliberately shows nothing about the database.
++app.get("/health", (req, res) => {
++  res.json({ status: "ok" });
+ });
+ 
+-app.post("/signup", async (req, res) => {
+-  const { username, email, password } = req.body;
++app.post("/signup", signupLimiter, async (req, res) => {
++  const checked = security.validateSignup(req.body);
+ 
+-  if (!username || !email || !password) {
+-    return res.status(400).json({
+-      message: "Username, email, and password are required",
+-    });
++  if (checked.error) {
++    return res.status(400).json({ message: checked.error });
+   }
+ 
++  const { username, email, password } = checked.value;
++
+   try {
++    // "Alice" and "alice" would look like the same person to others.
++    const taken = await pool.query(
++      `SELECT 1 FROM users WHERE lower(username) = lower($1) OR email = $2 LIMIT 1`,
++      [username, email],
++    );
++
++    if (taken.rows.length > 0) {
++      return res.status(409).json({
++        message: "That username or email is already in use",
++      });
++    }
++
+     const passwordHash = await bcrypt.hash(password, 10);
+ 
+     const result = await pool.query(
+@@ -627,7 +621,14 @@ app.post("/signup", async (req, res) => {
+       user: result.rows[0],
+     });
+   } catch (error) {
+-    console.log(error);
++    // 23505 = someone else just took it (unique constraint)
++    if (error.code === "23505") {
++      return res.status(409).json({
++        message: "That username or email is already in use",
++      });
++    }
++
++    console.error("Signup error:", error.code || error.message);
+ 
+     res.status(500).json({
+       message: "Failed to create account",
+@@ -635,51 +636,60 @@ app.post("/signup", async (req, res) => {
+   }
+ });
+ 
+-app.post("/login", async (req, res) => {
+-  const { username, password } = req.body;
++app.post("/login", loginIpLimiter, async (req, res) => {
++  const checked = security.validateLogin(req.body);
+ 
+-  if (!username || !password) {
+-    return res.status(400).json({
+-      message: "Username and password are required",
++  if (checked.error) {
++    return res.status(400).json({ message: checked.error });
++  }
++
++  const { username, password } = checked.value;
++
++  // Too many wrong passwords for this account from this address.
++  const failKey = `${req.ip}|${username.toLowerCase()}`;
++  const blocked = loginFailures.isBlocked(failKey);
++
++  if (blocked.blocked) {
++    res.setHeader("Retry-After", String(blocked.retryAfter));
++
++    return res.status(429).json({
++      message: "Too many failed attempts. Please try again later.",
+     });
+   }
+ 
+   try {
+     const result = await pool.query(
+       `
+-      SELECT *
++      SELECT id, username, email, public_id, password_hash
+       FROM users
+       WHERE username = $1
+       `,
+       [username],
+     );
+ 
+-    if (result.rows.length === 0) {
+-      return res.status(401).json({
+-        message: "Invalid username or password",
+-      });
+-    }
+-
+     const user = result.rows[0];
+ 
+-    const passwordMatches = await bcrypt.compare(password, user.password_hash);
++    // Always run bcrypt, so an unknown username takes as long as a wrong
++    // password and can't be told apart by timing.
++    const passwordMatches = await bcrypt.compare(
++      password,
++      user ? user.password_hash : DUMMY_HASH,
++    );
++
++    if (!user || !passwordMatches) {
++      loginFailures.hit(failKey);
+ 
+-    if (!passwordMatches) {
+       return res.status(401).json({
+         message: "Invalid username or password",
+       });
+     }
+ 
+-    const token = jwt.sign(
+-      {
+-        userId: user.id,
+-        username: user.username,
+-      },
+-      process.env.JWT_SECRET,
+-      {
+-        expiresIn: "7d",
+-      },
+-    );
++    loginFailures.reset(failKey);
++
++    const token = security.signToken({
++      userId: user.id,
++      username: user.username,
++    });
+ 
+     res.json({
+       message: "Login successful",
+@@ -692,7 +702,7 @@ app.post("/login", async (req, res) => {
+       },
+     });
+   } catch (error) {
+-    console.log(error);
++    console.error("Login error:", error.code || error.message);
+ 
+     res.status(500).json({
+       message: "Login failed",
+@@ -777,7 +787,7 @@ app.get("/me", authenticateToken, async (req, res) => {
+   }
+ });
+ 
+-app.get("/users/search", authenticateToken, async (req, res) => {
++app.get("/users/search", authenticateToken, searchLimiter, async (req, res) => {
+   // Only an exact ID matches, so nobody can browse or guess through the user list.
+   const publicId = String(req.query.id || "")
+     .toUpperCase()
+@@ -820,7 +830,11 @@ app.get("/users/search", authenticateToken, async (req, res) => {
+   }
+ });
+ 
+-app.post("/message-requests", authenticateToken, async (req, res) => {
++app.post(
++  "/message-requests",
++  authenticateToken,
++  requestLimiter,
++  async (req, res) => {
+   const senderId = req.user.userId;
+   const { targetUserId } = req.body;
+   const receiverId = Number(targetUserId);
+@@ -842,6 +856,13 @@ app.post("/message-requests", authenticateToken, async (req, res) => {
+   try {
+     await client.query("BEGIN");
+ 
++    // Two requests for the same pair of people run one after the other, so a
++    // double-click can't create duplicate pending requests.
++    await client.query("SELECT pg_advisory_xact_lock($1, $2)", [
++      Math.min(senderId, receiverId),
++      Math.max(senderId, receiverId),
++    ]);
++
+     // Make sure the target user exists.
+     const target = await client.query(`SELECT id FROM users WHERE id = $1`, [
+       receiverId,
+@@ -926,8 +947,8 @@ app.post("/message-requests", authenticateToken, async (req, res) => {
+       request,
+     });
+   } catch (error) {
+-    await client.query("ROLLBACK");
+-    console.error("Send message request error:", error);
++    await client.query("ROLLBACK").catch(() => {});
++    console.error("Send message request error:", error.code || error.message);
+ 
+     return res.status(500).json({
+       message: "Failed to send message request",
+@@ -1048,6 +1069,12 @@ app.post(
+         });
+       }
+ 
++      // Serialize per pair so two accepts can't create two conversations.
++      await client.query("SELECT pg_advisory_xact_lock($1, $2)", [
++        Math.min(request.sender_id, request.receiver_id),
++        Math.max(request.sender_id, request.receiver_id),
++      ]);
++
+       // Check whether a conversation already exists between these users.
+       const existingConversation = await client.query(
+         `
+@@ -1128,8 +1155,11 @@ app.post(
+         ...conversation,
+       });
+     } catch (error) {
+-      await client.query("ROLLBACK");
+-      console.error("Respond to message request error:", error);
++      await client.query("ROLLBACK").catch(() => {});
++      console.error(
++        "Respond to message request error:",
++        error.code || error.message,
++      );
+ 
+       return res.status(500).json({
+         message: "Failed to respond to message request",
+@@ -1140,13 +1170,17 @@ app.post(
+   },
+ );
+ 
++// Looks up the conversation you already have with someone. It never creates
++// one: a new conversation only exists once a message request is accepted
++// (POST /message-requests/:id/respond). Because nothing is written here, a
++// refused request can't leave an empty conversation behind.
+ app.post("/conversations", authenticateToken, async (req, res) => {
+   const currentUserId = req.user.userId;
+-  const { targetUserId } = req.body;
++  const targetUserId = security.parseId(req.body?.targetUserId);
+ 
+   if (!targetUserId) {
+     return res.status(400).json({
+-      message: "Target user is required",
++      message: "A valid target user is required",
+     });
+   }
+ 
+@@ -1183,22 +1217,15 @@ app.post("/conversations", authenticateToken, async (req, res) => {
+       });
+     }
+ 
+-    const conversation = await pool.query(
+-      `
+-        INSERT INTO conversations DEFAULT VALUES
+-        RETURNING id
+-        `,
+-    );
+-
+     return res.status(403).json({
+       message:
+         "A message request must be accepted before starting a new conversation",
+     });
+   } catch (error) {
+-    console.log("Conversation error:", error);
++    console.error("Conversation error:", error.code || error.message);
+ 
+     res.status(500).json({
+-      message: "Failed to create conversation",
++      message: "Failed to look up the conversation",
+     });
+   }
+ });
+@@ -1206,10 +1233,11 @@ app.post("/conversations", authenticateToken, async (req, res) => {
+ app.post(
+   "/conversations/:id/images",
+   authenticateToken,
++  uploadLimiter,
+   async (req, res, next) => {
+-    const conversationId = Number(req.params.id);
++    const conversationId = security.parseId(req.params.id);
+ 
+-    if (!Number.isInteger(conversationId)) {
++    if (!conversationId) {
+       return res.status(400).json({ message: "Invalid conversation" });
+     }
+ 
+@@ -1232,10 +1260,11 @@ app.post(
+         });
+       }
+ 
++      res.locals.conversationId = conversationId;
+       res.locals.keepHistory = result.rows[0].keep_history === true;
+       next();
+     } catch (error) {
+-      console.log("Upload check error:", error);
++      console.error("Upload check error:", error.code || error.message);
+ 
+       res.status(500).json({ message: "Failed to upload photo" });
+     }
+@@ -1258,7 +1287,8 @@ app.post(
+       return res.status(400).json({ message: "No photo was uploaded" });
+     }
+ 
+-    const type = detectImageType(req.file.buffer);
++    // Judged by the file's own bytes, not its name or reported type.
++    const type = uploads.detectImageType(req.file.buffer);
+ 
+     if (!type) {
+       return res.status(400).json({
+@@ -1266,26 +1296,86 @@ app.post(
+       });
+     }
+ 
+-    const name = `${crypto.randomBytes(16).toString("hex")}.${type}`;
+-    const keepHistory = res.locals.keepHistory;
+-
+     try {
+-      await fs.promises.writeFile(
+-        path.join(keepHistory ? UPLOAD_DIR : TEMP_DIR, name),
++      const name = await uploads.saveImage(
++        res.locals.conversationId,
+         req.file.buffer,
++        type,
++        !res.locals.keepHistory,
+       );
+ 
+-      res.json({
+-        url: keepHistory ? `/uploads/${name}` : `/uploads/tmp/${name}`,
+-      });
++      res.json({ url: uploads.imageUrl(res.locals.conversationId, name) });
+     } catch (error) {
+-      console.log("Upload save error:", error);
++      console.error("Upload save error:", error.code || error.message);
+ 
+       res.status(500).json({ message: "Failed to save photo" });
+     }
+   },
+ );
+ 
++// The only way to read a photo: you must be logged in AND be a member of the
++// conversation the photo belongs to.
++app.get(
++  "/conversations/:id/images/:name",
++  authenticateToken,
++  imageReadLimiter,
++  async (req, res) => {
++    const conversationId = security.parseId(req.params.id);
++    const name = req.params.name;
++
++    // One answer for a bad address, someone else's conversation and a missing
++    // file, so this can't be used to find out what exists.
++    const notFound = () => res.status(404).json({ message: "Photo not found" });
++
++    if (!conversationId || !uploads.isValidImageName(name)) return notFound();
++
++    try {
++      const membership = await pool.query(
++        `
++        SELECT 1
++        FROM conversation_members
++        WHERE conversation_id = $1
++          AND user_id = $2
++        `,
++        [conversationId, req.user.userId],
++      );
++
++      if (membership.rows.length === 0) return notFound();
++
++      const found = await uploads.findImage(conversationId, name);
++
++      if (!found) return notFound();
++
++      // "root" keeps the file name check separate from the folder path.
++      res.sendFile(
++        path.basename(found.file),
++        {
++          root: path.dirname(found.file),
++          dotfiles: "deny",
++          cacheControl: false,
++          headers: {
++            "Content-Type": uploads.mimeTypeFor(name),
++            "X-Content-Type-Options": "nosniff",
++            "Content-Security-Policy": "default-src 'none'; sandbox",
++            "Content-Disposition": "inline",
++            // Never stored by shared caches; always re-checked with login.
++            "Cache-Control": "private, no-cache",
++          },
++        },
++        (error) => {
++          if (error && !res.headersSent) notFound();
++        },
++      );
++    } catch (error) {
++      console.error("Photo read error:", error.code || error.message);
++
++      if (!res.headersSent) {
++        res.status(500).json({ message: "Failed to load photo" });
++      }
++    }
++  },
++);
++
+ app.get("/conversations", authenticateToken, async (req, res) => {
+   const currentUserId = req.user.userId;
+ 
+@@ -1430,16 +1520,15 @@ app.delete("/messages", authenticateToken, async (req, res) => {
+ 
+     if (ids.length > 0) {
+       const result = await pool.query(
+-        `DELETE FROM messages WHERE room = ANY($1::text[]) RETURNING image_url`,
++        `DELETE FROM messages WHERE room = ANY($1::text[])`,
+         [rooms],
+       );
+ 
+       deleted = result.rowCount;
+ 
+-      // Remove the saved photo files too, not just the database rows.
+-      for (const row of result.rows) {
+-        deleteUpload(row.image_url);
+-      }
++      // Remove every photo file of these conversations (saved and temporary),
++      // not just the database rows.
++      await uploads.deleteConversationImages(ids);
+ 
+       await pool.query(
+         `
+@@ -1488,18 +1577,50 @@ app.delete("/messages", authenticateToken, async (req, res) => {
+   }
+ });
+ 
++// Anything that didn't match a route
++app.use((req, res) => {
++  res.status(404).json({ message: "Not found" });
++});
++
++// Last stop for errors: always JSON, never a stack trace.
++app.use((error, req, res, next) => {
++  if (res.headersSent) return next(error);
++
++  if (error.type === "entity.parse.failed") {
++    return res.status(400).json({ message: "Invalid JSON" });
++  }
++
++  if (error.type === "entity.too.large") {
++    return res.status(413).json({ message: "Request is too large" });
++  }
++
++  console.error("Unhandled error:", error.message);
++
++  res.status(500).json({ message: "Something went wrong" });
++});
++
++process.on("unhandledRejection", (reason) => {
++  console.error("Unhandled promise rejection:", reason?.message || reason);
++});
++
+ // Update the database first, then start accepting connections.
+ runMigrations()
+-  .then(() => {
+-    // Needs the database to be up to date first.
+-    cleanOrphanUploads();
+-    setInterval(cleanOrphanUploads, 30 * 60 * 1000).unref();
++  .then(async () => {
++    await uploads.ensureUploadDirs();
++
++    // Photos used to be public. Move them into private storage once.
++    await uploads.migrateLegacyUploads();
++
++    uploads.cleanTempUploads();
++    uploads.cleanOrphanUploads();
++    setInterval(uploads.cleanTempUploads, 10 * 60 * 1000).unref();
++    setInterval(uploads.cleanOrphanUploads, 30 * 60 * 1000).unref();
+ 
+     server.listen(PORT, () => {
+       console.log(`Server is running on port ${PORT}`);
+     });
+   })
+   .catch((error) => {
+-    console.error("Database setup failed:", error);
++    console.error("Startup failed:", error.message);
+     process.exit(1);
+   });
+diff --git a/backend/test/api.test.mjs b/backend/test/api.test.mjs
+new file mode 100644
+index 0000000..a2ca0ee
+--- /dev/null
++++ b/backend/test/api.test.mjs
+@@ -0,0 +1,923 @@
++// Integration tests: starts the real server and talks to it over HTTP and
++// WebSockets. Needs PostgreSQL (the one in backend/.env, or set TEST_DB_NAME).
++// It only creates users named zt<random>..., and removes everything it made.
++import { test, describe, before, after } from "node:test";
++import assert from "node:assert/strict";
++import { spawn, spawnSync } from "node:child_process";
++import http from "node:http";
++import net from "node:net";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import crypto from "node:crypto";
++import { fileURLToPath } from "node:url";
++import jwt from "jsonwebtoken";
++import { io } from "socket.io-client";
++
++const backendDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
++process.chdir(backendDir);
++if (process.env.TEST_DB_NAME) process.env.DB_NAME = process.env.TEST_DB_NAME;
++
++const pool = (await import("../db.js")).default;
++const { runMigrations } = await import("../migrate.js");
++
++let dbReady = true;
++try {
++  await pool.query("SELECT 1");
++} catch {
++  dbReady = false;
++  console.warn("PostgreSQL is not reachable: skipping the API tests.");
++}
++
++const SECRET = crypto.randomBytes(24).toString("hex");
++const root = fs.mkdtempSync(path.join(os.tmpdir(), "pw-api-test-"));
++const UPLOAD = path.join(root, "storage");
++const LEGACY = path.join(root, "legacy");
++const PUBLIC_DIR = path.join(backendDir, "public");
++const tag = crypto.randomBytes(3).toString("hex");
++
++const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
++const freePort = () =>
++  new Promise((resolve) => {
++    const probe = net.createServer().listen(0, () => {
++      const { port } = probe.address();
++      probe.close(() => resolve(port));
++    });
++  });
++
++/* ---------- starting servers ---------- */
++
++async function startServer(extraEnv = {}) {
++  const port = await freePort();
++  const child = spawn(process.execPath, ["server.js"], {
++    cwd: backendDir,
++    env: {
++      ...process.env,
++      PORT: String(port),
++      JWT_SECRET: SECRET,
++      UPLOAD_DIR: UPLOAD,
++      LEGACY_UPLOAD_DIR: LEGACY,
++      CLIENT_ORIGIN: "http://localhost:5173",
++      NODE_ENV: "test",
++      ...extraEnv,
++    },
++    stdio: ["ignore", "pipe", "pipe"],
++  });
++
++  let logs = "";
++  child.stdout.on("data", (d) => (logs += d));
++  child.stderr.on("data", (d) => (logs += d));
++
++  await new Promise((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error(`server did not start:\n${logs}`)), 25000);
++    child.stdout.on("data", () => {
++      if (logs.includes("Server is running")) {
++        clearTimeout(timer);
++        resolve();
++      }
++    });
++    child.on("exit", (code) => {
++      clearTimeout(timer);
++      reject(new Error(`server exited early (${code}):\n${logs}`));
++    });
++  });
++
++  return { child, port, base: `http://127.0.0.1:${port}`, logs: () => logs };
++}
++
++function runServerExpectingExit(extraEnv) {
++  return spawnSync(process.execPath, ["server.js"], {
++    cwd: backendDir,
++    env: { ...process.env, PORT: "0", NODE_ENV: "test", ...extraEnv },
++    encoding: "utf8",
++    timeout: 20000,
++  });
++}
++
++/* ---------- helpers ---------- */
++
++let main; // the main server
++const sockets = [];
++const createdUserIds = [];
++
++const api = async (p, { method = "GET", token, json, form, body, headers = {}, server = main } = {}) => {
++  const res = await fetch(server.base + p, {
++    method,
++    headers: {
++      ...(token ? { Authorization: `Bearer ${token}` } : {}),
++      ...(json !== undefined ? { "Content-Type": "application/json" } : {}),
++      ...headers,
++    },
++    body: form ?? (json !== undefined ? JSON.stringify(json) : body),
++  });
++  const buf = Buffer.from(await res.arrayBuffer());
++  let data = null;
++  try { data = JSON.parse(buf.toString()); } catch { /* not JSON */ }
++  return { status: res.status, headers: res.headers, buf, data };
++};
++
++// Sends the path exactly as written (fetch would tidy ".." away).
++const raw = (pathname, { token, headers = {}, method = "GET" } = {}) =>
++  new Promise((resolve, reject) => {
++    const req = http.request(
++      { host: "127.0.0.1", port: main.port, path: pathname, method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers } },
++      (res) => {
++        const chunks = [];
++        res.on("data", (c) => chunks.push(c));
++        res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
++      },
++    );
++    req.on("error", reject);
++    req.end();
++  });
++
++const photoForm = (bytes, { field = "image", filename = "photo.jpg", type = "image/jpeg" } = {}) => {
++  const form = new FormData();
++  form.append(field, new Blob([bytes], { type }), filename);
++  return form;
++};
++
++const pad = (head, size = 200) => Buffer.concat([head, crypto.randomBytes(Math.max(0, size - head.length))]);
++const makeJpeg = () => pad(Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
++const makePng = () => pad(Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]), Buffer.from("IHDR")]));
++const makeWebp = () => pad(Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WEBPVP8 ")]));
++
++async function makeUser(name) {
++  const username = `zt${tag}${name}`;
++  const password = "a-good-password-1";
++  const signup = await api("/signup", { method: "POST", json: { username, email: `${username}@example.test`, password } });
++  assert.equal(signup.status, 201, `signup ${name}: ${signup.buf}`);
++  const login = await api("/login", { method: "POST", json: { username, password } });
++  assert.equal(login.status, 200);
++  createdUserIds.push(signup.data.user.id);
++  return { name, username, password, id: signup.data.user.id, token: login.data.token, publicId: signup.data.user.public_id };
++}
++
++async function befriend(a, b) {
++  const sent = await api("/message-requests", { method: "POST", token: a.token, json: { targetUserId: b.id } });
++  assert.equal(sent.status, 201, String(sent.buf));
++  const accepted = await api(`/message-requests/${sent.data.request.id}/respond`, { method: "POST", token: b.token, json: { action: "accept" } });
++  assert.equal(accepted.status, 200, String(accepted.buf));
++  return accepted.data.conversationId;
++}
++
++const connect = (token, server = main) =>
++  new Promise((resolve, reject) => {
++    const socket = io(server.base, { auth: { token }, transports: ["websocket"], reconnection: false });
++    sockets.push(socket);
++    socket.on("connect", () => resolve(socket));
++    socket.on("connect_error", reject);
++  });
++
++const once = (socket, event, ms = 700) =>
++  new Promise((resolve) => {
++    const timer = setTimeout(() => resolve(null), ms);
++    socket.once(event, (data) => { clearTimeout(timer); resolve(data); });
++  });
++
++async function joinRoom(socket, conversationId) {
++  const history = once(socket, "chat_history", 3000);
++  socket.emit("join_room", `conversation_${conversationId}`);
++  return history;
++}
++
++const countOrphans = async () =>
++  Number((await pool.query(`SELECT COUNT(*) FROM conversations c WHERE NOT EXISTS (SELECT 1 FROM conversation_members m WHERE m.conversation_id = c.id)`)).rows[0].count);
++const countMemberships = async (ids) =>
++  Number((await pool.query(`SELECT COUNT(*) FROM conversation_members WHERE user_id = ANY($1::int[])`, [ids])).rows[0].count);
++const countConversationsOf = async (ids) =>
++  Number((await pool.query(`SELECT COUNT(DISTINCT conversation_id) FROM conversation_members WHERE user_id = ANY($1::int[])`, [ids])).rows[0].count);
++
++/* ---------- the tests ---------- */
++
++const suite = dbReady ? describe : describe.skip;
++
++suite("API", () => {
++  let alice, bob, carol, dave;
++  let C1, C2, C3; // alice-bob, carol-dave, bob-carol
++
++  before(async () => {
++    main = await startServer();
++    [alice, bob, carol, dave] = [await makeUser("alice"), await makeUser("bob"), await makeUser("carol"), await makeUser("dave")];
++    C1 = await befriend(alice, bob);
++    C2 = await befriend(carol, dave);
++    C3 = await befriend(bob, carol);
++    await api("/settings/history", { method: "PATCH", token: alice.token, json: { keepHistory: true } });
++    await api("/settings/history", { method: "PATCH", token: carol.token, json: { keepHistory: true } });
++  });
++
++  after(async () => {
++    for (const socket of sockets) socket.close();
++    main?.child.kill();
++
++    try {
++      const convs = (await pool.query(`SELECT DISTINCT conversation_id FROM conversation_members WHERE user_id = ANY($1::int[])`, [createdUserIds])).rows.map((r) => r.conversation_id);
++      await pool.query(`DELETE FROM messages WHERE room = ANY($1::text[])`, [convs.map((id) => `conversation_${id}`)]);
++      await pool.query(`DELETE FROM message_requests WHERE sender_id = ANY($1::int[]) OR receiver_id = ANY($1::int[])`, [createdUserIds]);
++      await pool.query(`DELETE FROM conversation_members WHERE conversation_id = ANY($1::int[])`, [convs]);
++      await pool.query(`DELETE FROM conversations WHERE id = ANY($1::int[])`, [convs]);
++      await pool.query(`DELETE FROM users WHERE id = ANY($1::int[])`, [createdUserIds]);
++    } catch (error) {
++      console.warn("Test clean-up problem:", error.message);
++    }
++
++    await pool.end();
++    fs.rmSync(root, { recursive: true, force: true });
++  });
++
++  /* ======================= 1. PRIVATE PHOTOS ======================= */
++
++  describe("private photos", () => {
++    const jpeg = makeJpeg();
++    let url, name;
++
++    before(async () => {
++      const up = await api(`/conversations/${C1}/images`, { method: "POST", token: alice.token, form: photoForm(jpeg) });
++      assert.equal(up.status, 200, String(up.buf));
++      url = up.data.url;
++      name = path.basename(url);
++    });
++
++    test("upload returns a private, conversation-scoped address (not /uploads)", () => {
++      assert.match(url, new RegExp(`^/conversations/${C1}/images/[a-f0-9]{32}\\.jpg$`));
++    });
++
++    test("nothing is served from /uploads or any public path any more", async () => {
++      for (const p of [`/uploads/${name}`, `/uploads/${C1}/${name}`, `/uploads/tmp/${name}`, `/uploads/`, "/uploads", `/${name}`, `/storage/uploads/${C1}/${name}`, `/public/${name}`]) {
++        for (const token of [undefined, bob.token]) {
++          assert.equal((await api(p, { token })).status, 404, p);
++        }
++      }
++    });
++
++    test("files are stored outside the public folder", () => {
++      assert.ok(fs.existsSync(path.join(UPLOAD, String(C1), name)));
++      assert.ok(!path.resolve(UPLOAD).startsWith(PUBLIC_DIR + path.sep));
++      assert.ok(!fs.readdirSync(PUBLIC_DIR, { recursive: true }).some((f) => String(f).includes(name)));
++    });
++
++    test("members can read the photo, with safe headers", async () => {
++      for (const user of [alice, bob]) {
++        const r = await api(url, { token: user.token });
++        assert.equal(r.status, 200);
++        assert.ok(r.buf.equals(jpeg), "exact bytes");
++        assert.equal(r.headers.get("content-type"), "image/jpeg");
++        assert.equal(r.headers.get("x-content-type-options"), "nosniff");
++        assert.match(r.headers.get("content-security-policy"), /default-src 'none'/);
++        assert.equal(r.headers.get("cache-control"), "private, no-cache");
++        assert.match(r.headers.get("content-disposition"), /^inline/);
++      }
++    });
++
++    test("no login, a bad login, or a non-member cannot read it", async () => {
++      assert.equal((await api(url)).status, 401);
++      assert.equal((await api(url, { token: "garbage" })).status, 403);
++      assert.equal((await api(url, { headers: { Authorization: "Basic abc" } })).status, 401);
++
++      const missing = await api(`/conversations/${C1}/images/${"0".repeat(32)}.jpg`, { token: carol.token });
++      for (const user of [carol, dave]) {
++        const r = await api(url, { token: user.token });
++        assert.equal(r.status, 404);
++        assert.ok(!r.buf.equals(jpeg));
++        assert.deepEqual(r.data, missing.data, "same answer as a photo that doesn't exist");
++      }
++    });
++
++    test("a photo can't be read through a different conversation", async () => {
++      // bob is in C1 and C3; carol is in C2 and C3
++      assert.equal((await api(`/conversations/${C3}/images/${name}`, { token: bob.token })).status, 404);
++      assert.equal((await api(`/conversations/${C3}/images/${name}`, { token: carol.token })).status, 404);
++      assert.equal((await api(`/conversations/${C2}/images/${name}`, { token: carol.token })).status, 404);
++    });
++
++    test("path traversal and malformed addresses never return a file", async () => {
++      const attempts = [
++        `/conversations/${C1}/images/..%2F..%2Fserver.js`,
++        `/conversations/${C1}/images/%2e%2e%2f%2e%2e%2fserver.js`,
++        `/conversations/${C1}/images/..%5C..%5Cserver.js`,
++        `/conversations/${C1}/images/${name}%00`,
++        `/conversations/${C1}/images/${name}%00.png`,
++        `/conversations/${C1}/images/${name}/..`,
++        `/conversations/${C1}/images/${name}.exe`,
++        `/conversations/${C1}/images/${name.toUpperCase()}`,
++        `/conversations/${C1}/images/`,
++        `/conversations/${C1}/images/%2e%2e/${name}`,
++        `/conversations/${C1}/images/../../../etc/passwd`,
++        `/conversations/${C1}/images/....//....//server.js`,
++        `/conversations/0/images/${name}`,
++        `/conversations/-1/images/${name}`,
++        `/conversations/1e1/images/${name}`,
++        `/conversations/${C1}%20/images/${name}`,
++        `/conversations/99999999999/images/${name}`,
++        `//conversations/${C1}/images/${name}`,
++        `/conversations/${C1}/images/${"a".repeat(5000)}`,
++      ];
++
++      for (const attempt of attempts) {
++        const r = await raw(attempt, { token: bob.token });
++        assert.ok(r.status >= 400 && r.status < 500, `${attempt.slice(0, 80)} -> ${r.status}`);
++        assert.ok(!r.body.equals(jpeg));
++        assert.ok(!r.body.toString().includes("require("), "never returns source code");
++      }
++    });
++
++    test("only real JPEG, PNG and WebP photos are accepted, judged by their bytes", async () => {
++      for (const [label, bytes, type] of [["PNG", makePng(), "image/png"], ["WebP", makeWebp(), "image/webp"]]) {
++        const up = await api(`/conversations/${C1}/images`, { method: "POST", token: alice.token, form: photoForm(bytes, { type, filename: "x" }) });
++        assert.equal(up.status, 200, label);
++        const read = await api(up.data.url, { token: bob.token });
++        assert.equal(read.headers.get("content-type"), type);
++        assert.ok(read.buf.equals(bytes));
++      }
++
++      const disguised = {
++        "text called .jpg": Buffer.from("this is not a photo at all, just plain text that is long enough"),
++        "GIF": pad(Buffer.from("GIF89a")),
++        "SVG with script": pad(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')),
++        "HTML": pad(Buffer.from("<!doctype html><script>alert(1)</script>")),
++        "PNG signature only": pad(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
++        "empty": Buffer.alloc(0),
++      };
++
++      for (const [label, bytes] of Object.entries(disguised)) {
++        const up = await api(`/conversations/${C1}/images`, { method: "POST", token: alice.token, form: photoForm(bytes) });
++        assert.equal(up.status, 400, label);
++      }
++    });
++
++    test("the file name sent by the client is ignored", async () => {
++      const up = await api(`/conversations/${C1}/images`, { method: "POST", token: alice.token, form: photoForm(makeJpeg(), { filename: "../../evil.jpg" }) });
++      assert.equal(up.status, 200);
++      assert.match(up.data.url, /^\/conversations\/\d+\/images\/[a-f0-9]{32}\.jpg$/);
++      assert.ok(!fs.existsSync(path.join(UPLOAD, "..", "evil.jpg")));
++      assert.ok(!fs.existsSync(path.join(UPLOAD, "evil.jpg")));
++    });
++
++    test("files over 5 MB are refused", async () => {
++      const big = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(6 * 1024 * 1024)]);
++      const up = await api(`/conversations/${C1}/images`, { method: "POST", token: alice.token, form: photoForm(big) });
++      assert.equal(up.status, 413);
++    });
++
++    test("bad upload requests are refused", async () => {
++      const post = (id, opts) => api(`/conversations/${id}/images`, { method: "POST", ...opts });
++      assert.equal((await post(C1, { form: photoForm(makeJpeg()) })).status, 401, "no login");
++      assert.equal((await post(C1, { token: carol.token, form: photoForm(makeJpeg()) })).status, 404, "not a member");
++      assert.equal((await post("abc", { token: alice.token, form: photoForm(makeJpeg()) })).status, 400);
++      assert.equal((await post("0", { token: alice.token, form: photoForm(makeJpeg()) })).status, 400);
++      assert.equal((await post("1e1", { token: alice.token, form: photoForm(makeJpeg()) })).status, 400);
++      assert.equal((await post(C1, { token: alice.token, form: photoForm(makeJpeg(), { field: "file" }) })).status, 400, "wrong field name");
++      assert.equal((await post(C1, { token: alice.token, json: { hello: "world" } })).status, 400, "no file");
++      assert.equal((await post(C1, { token: alice.token })).status, 400, "empty body");
++    });
++
++    describe("sending photos in chat", () => {
++      let sa, sb, sc;
++      const room = () => `conversation_${C1}`;
++
++      before(async () => {
++        [sa, sb, sc] = [await connect(alice.token), await connect(bob.token), await connect(carol.token)];
++        await joinRoom(sa, C1);
++        await joinRoom(sb, C1);
++      });
++
++      test("a photo is delivered, saved, and shows up in history", async () => {
++        const up = await api(`/conversations/${C1}/images`, { method: "POST", token: alice.token, form: photoForm(makeJpeg()) });
++        const delivered = once(sb, "chat_message", 2000);
++        sa.emit("chat_message", { room: room(), type: "image", imageUrl: up.data.url });
++        const message = await delivered;
++        assert.equal(message.type, "image");
++        assert.equal(message.imageUrl, up.data.url);
++
++        const history = await joinRoom(sb, C1);
++        const saved = history.find((m) => m.image_url === up.data.url);
++        assert.equal(saved.message_type, "image");
++      });
++
++      test("a photo from another conversation, or a made-up address, is ignored", async () => {
++        const other = await api(`/conversations/${C2}/images`, { method: "POST", token: carol.token, form: photoForm(makeJpeg()) });
++        const name2 = path.basename(other.data.url);
++        const own = await api(`/conversations/${C1}/images`, { method: "POST", token: alice.token, form: photoForm(makeJpeg()) });
++        const ownName = path.basename(own.data.url);
++
++        const bad = [
++          other.data.url, // belongs to C2
++          `/conversations/${C1}/images/${name2}`, // C2's file name under C1
++          `/conversations/${C1}/images/${"1".repeat(32)}.jpg`, // doesn't exist
++          `/uploads/${ownName}`, // the old public style
++          `/conversations/${C1}/images/../images/${ownName}`,
++          `http://evil.example/${ownName}`,
++          `/conversations/${C1}/images/${ownName}?x=1`,
++          "", null, {}, [], 5,
++        ];
++
++        for (const imageUrl of bad) {
++          const got = once(sb, "chat_message", 250);
++          sa.emit("chat_message", { room: room(), type: "image", imageUrl });
++          assert.equal(await got, null, String(JSON.stringify(imageUrl)).slice(0, 70));
++        }
++
++        const notMine = once(sb, "chat_message", 300);
++        sa.emit("chat_message", { room: `conversation_${C3}`, type: "image", imageUrl: `/conversations/${C3}/images/${ownName}` });
++        assert.equal(await notMine, null, "alice isn't in C3");
++      });
++
++      test("with history off, photos are temporary and not saved; turning history on keeps them", async () => {
++        await api("/settings/history", { method: "PATCH", token: alice.token, json: { keepHistory: false } });
++
++        const up = await api(`/conversations/${C1}/images`, { method: "POST", token: alice.token, form: photoForm(makeJpeg()) });
++        const fileName = path.basename(up.data.url);
++        const tempFile = path.join(UPLOAD, "tmp", String(C1), fileName);
++        assert.ok(fs.existsSync(tempFile), "stored in temporary storage");
++        assert.equal((await api(up.data.url, { token: bob.token })).status, 200, "still readable by members");
++
++        const delivered = once(sb, "chat_message", 2000);
++        sa.emit("chat_message", { room: room(), type: "image", imageUrl: up.data.url });
++        assert.ok(await delivered);
++        assert.ok(!(await joinRoom(sb, C1)).some((m) => m.image_url === up.data.url), "not in history");
++
++        await api("/settings/history", { method: "PATCH", token: alice.token, json: { keepHistory: true } });
++        const keep = await api(`/conversations/${C1}/images`, { method: "POST", token: alice.token, form: photoForm(makeJpeg()) });
++        const keepName = path.basename(keep.data.url);
++        await api("/settings/history", { method: "PATCH", token: alice.token, json: { keepHistory: false } });
++        await api("/settings/history", { method: "PATCH", token: alice.token, json: { keepHistory: true } });
++        sa.emit("chat_message", { room: room(), type: "image", imageUrl: keep.data.url });
++        await once(sb, "chat_message", 1500);
++        assert.ok(fs.existsSync(path.join(UPLOAD, String(C1), keepName)), "saved folder");
++      });
++
++      test("non-members get nothing from the room and can't post into it", async () => {
++        assert.equal(await joinRoom(sc, C1), null, "no history for a non-member");
++        const got = once(sb, "chat_message", 400);
++        sc.emit("chat_message", { room: room(), message: "hello from an outsider" });
++        assert.equal(await got, null);
++      });
++    });
++
++    test("the panic button deletes the photo files, but only for the caller's own conversations", async () => {
++      const keep = await api(`/conversations/${C2}/images`, { method: "POST", token: carol.token, form: photoForm(makeJpeg()) });
++      assert.equal((await api(url, { token: bob.token })).status, 200);
++
++      const panic = await api("/messages", { method: "DELETE", token: bob.token });
++      assert.equal(panic.status, 200);
++
++      assert.ok(!fs.existsSync(path.join(UPLOAD, String(C1))), "saved photos gone");
++      assert.ok(!fs.existsSync(path.join(UPLOAD, "tmp", String(C1))), "temporary photos gone");
++      assert.equal((await api(url, { token: bob.token })).status, 404);
++      assert.equal((await api(url, { token: alice.token })).status, 404);
++      assert.equal((await api(keep.data.url, { token: dave.token })).status, 200, "bob can't touch carol and dave's chat");
++    });
++  });
++
++  describe("moving old public photos into private storage", () => {
++    test("referenced photos move, the old address stops working, missing files are handled", async () => {
++      const legacyName = `${crypto.randomBytes(16).toString("hex")}.jpg`;
++      const missingName = `${crypto.randomBytes(16).toString("hex")}.jpg`;
++      const bytes = makeJpeg();
++
++      fs.mkdirSync(path.join(LEGACY, "tmp"), { recursive: true });
++      fs.writeFileSync(path.join(LEGACY, legacyName), bytes);
++      fs.writeFileSync(path.join(LEGACY, "tmp", `${"b".repeat(32)}.jpg`), bytes);
++
++      for (const file of [legacyName, missingName]) {
++        await pool.query(
++          `INSERT INTO messages (room, username, content, message_type, image_url) VALUES ($1, $2, '📷 Photo', 'image', $3)`,
++          [`conversation_${C1}`, alice.username, `/uploads/${file}`],
++        );
++      }
++
++      const second = await startServer({ UPLOAD_DIR: path.join(root, "storage2") });
++
++      try {
++        const rows = (await pool.query(`SELECT image_url FROM messages WHERE room = $1 AND image_url LIKE $2`, [`conversation_${C1}`, "%" + legacyName.slice(0, 32) + "%"])).rows;
++        assert.equal(rows[0].image_url, `/conversations/${C1}/images/${legacyName}`);
++        assert.ok(fs.existsSync(path.join(root, "storage2", String(C1), legacyName)));
++        assert.ok(!fs.existsSync(path.join(LEGACY, legacyName)), "removed from the public folder");
++        assert.ok(!fs.existsSync(path.join(LEGACY, "tmp")), "old temporary photos deleted");
++
++        assert.equal((await api(`/uploads/${legacyName}`, { server: second })).status, 404);
++        const read = await api(`/conversations/${C1}/images/${legacyName}`, { token: bob.token, server: second });
++        assert.equal(read.status, 200);
++        assert.ok(read.buf.equals(bytes));
++        assert.equal((await api(`/conversations/${C1}/images/${legacyName}`, { token: carol.token, server: second })).status, 404);
++
++        const gone = (await pool.query(`SELECT image_url FROM messages WHERE image_url = $1`, [`/conversations/${C1}/images/${missingName}`])).rows;
++        assert.equal(gone.length, 1, "address rewritten even though the file was gone");
++        assert.equal((await api(`/conversations/${C1}/images/${missingName}`, { token: bob.token, server: second })).status, 404);
++      } finally {
++        second.child.kill();
++      }
++    });
++  });
++
++  /* ======================= 2. CONVERSATION CREATION ======================= */
++
++  describe("POST /conversations leaves nothing behind", () => {
++    const post = (token, targetUserId) => api("/conversations", { method: "POST", token, json: { targetUserId } });
++
++    test("a refused request creates no conversation and no members", async () => {
++      const orphans = await countOrphans();
++      const ids = [alice.id, carol.id];
++      const [members, convs] = [await countMemberships(ids), await countConversationsOf(ids)];
++
++      const r = await post(alice.token, carol.id); // no conversation, no accepted request
++      assert.equal(r.status, 403);
++      assert.match(r.data.message, /message request must be accepted/);
++
++      assert.equal(await countOrphans(), orphans, "no empty conversation");
++      assert.equal(await countMemberships(ids), members);
++      assert.equal(await countConversationsOf(ids), convs);
++    });
++
++    test("invalid targets are rejected with 400 and write nothing", async () => {
++      const orphans = await countOrphans();
++      const bad = ["abc", 0, -5, 1.5, "1e2", "0x10", "", null, true, [dave.id], { id: dave.id }, 2 ** 40, "5; DROP TABLE users", undefined];
++
++      for (const target of bad) {
++        const r = await post(alice.token, target);
++        assert.equal(r.status, 400, JSON.stringify(target));
++      }
++
++      assert.equal(await countOrphans(), orphans);
++    });
++
++    test("you can't start a conversation with yourself (number or text)", async () => {
++      const orphans = await countOrphans();
++      assert.equal((await post(alice.token, alice.id)).status, 400);
++      assert.equal((await post(alice.token, String(alice.id))).status, 400);
++      assert.equal(await countOrphans(), orphans);
++    });
++
++    test("an unknown user is refused without writing anything", async () => {
++      const orphans = await countOrphans();
++      assert.equal((await post(alice.token, 2147483647)).status, 403);
++      assert.equal(await countOrphans(), orphans);
++    });
++
++    test("an existing conversation is returned, not duplicated", async () => {
++      const ids = [alice.id, bob.id];
++      const before = await countConversationsOf(ids);
++      const r = await post(alice.token, bob.id);
++      assert.equal(r.status, 200);
++      assert.equal(r.data.conversationId, C1);
++      assert.equal(r.data.room, `conversation_${C1}`);
++      assert.equal((await post(alice.token, String(bob.id))).data.conversationId, C1, "id as text works too");
++      assert.equal(await countConversationsOf(ids), before);
++    });
++
++    test("25 requests at once still create nothing", async () => {
++      const orphans = await countOrphans();
++      const results = await Promise.all(Array.from({ length: 25 }, () => post(alice.token, carol.id)));
++      assert.ok(results.every((r) => r.status === 403));
++      assert.equal(await countOrphans(), orphans);
++    });
++
++    test("needs a login", async () => {
++      assert.equal((await post(undefined, bob.id)).status, 401);
++    });
++
++    test("empty conversations left behind by the old bug are cleaned up at startup", async () => {
++      const inserted = [];
++      for (let i = 0; i < 3; i += 1) inserted.push((await pool.query(`INSERT INTO conversations DEFAULT VALUES RETURNING id`)).rows[0].id);
++      assert.ok((await countOrphans()) >= 3);
++
++      await runMigrations();
++
++      const left = (await pool.query(`SELECT id FROM conversations WHERE id = ANY($1::int[])`, [inserted])).rows;
++      assert.equal(left.length, 0, "orphans removed");
++      assert.equal(await countOrphans(), 0);
++      const real = (await pool.query(`SELECT id FROM conversations WHERE id = ANY($1::int[])`, [[C1, C2, C3]])).rows;
++      assert.equal(real.length, 3, "real conversations untouched");
++    });
++  });
++
++  /* ======================= 3. SECURITY & RELIABILITY ======================= */
++
++  describe("message requests: authorization and races", () => {
++    const send = (token, targetUserId) => api("/message-requests", { method: "POST", token, json: { targetUserId } });
++    let requestId;
++
++    test("input is validated", async () => {
++      assert.equal((await send(undefined, bob.id)).status, 401);
++      for (const target of ["abc", 0, -1, 1.5, null, [], {}]) assert.equal((await send(dave.token, target)).status, 400, JSON.stringify(target));
++      assert.equal((await send(dave.token, dave.id)).status, 400, "yourself");
++      assert.equal((await send(dave.token, 2147483647)).status, 404, "unknown user");
++      assert.equal((await send(alice.token, bob.id)).status, 409, "already have a conversation");
++    });
++
++    test("only the person who received a request can answer it", async () => {
++      const sent = await send(dave.token, alice.id);
++      assert.equal(sent.status, 201);
++      requestId = sent.data.request.id;
++      const respond = (token, action, id = requestId) => api(`/message-requests/${id}/respond`, { method: "POST", token, json: { action } });
++
++      assert.equal((await respond(undefined, "accept")).status, 401);
++      assert.equal((await respond(dave.token, "accept")).status, 403, "the sender can't accept their own request");
++      assert.equal((await respond(carol.token, "accept")).status, 403, "a stranger can't");
++      assert.equal((await respond(alice.token, "maybe")).status, 400);
++      assert.equal((await respond(alice.token, "accept", "abc")).status, 400);
++      assert.equal((await respond(alice.token, "accept", 2147483647)).status, 404);
++
++      assert.equal((await respond(alice.token, "reject")).status, 200);
++      assert.equal((await respond(alice.token, "accept")).status, 409, "already handled");
++      assert.equal((await respond(alice.token, "reject")).status, 409);
++    });
++
++    test("eight identical requests at once leave exactly one pending request", async () => {
++      const results = await Promise.all(Array.from({ length: 8 }, () => send(dave.token, alice.id)));
++      assert.equal(results.filter((r) => r.status === 201).length, 1);
++      assert.equal(results.filter((r) => r.status === 409).length, 7);
++
++      const pending = await pool.query(
++        `SELECT COUNT(*) FROM message_requests WHERE status = 'pending' AND ((sender_id = $1 AND receiver_id = $2) OR (sender_id = $2 AND receiver_id = $1))`,
++        [dave.id, alice.id],
++      );
++      assert.equal(Number(pending.rows[0].count), 1);
++    });
++  });
++
++  describe("sign-up and login", () => {
++    test("sign-up validates its input", async () => {
++      const post = (json, headers) => api("/signup", { method: "POST", json, headers });
++      const base = { username: `zt${tag}new`, email: `zt${tag}new@example.test`, password: "long-enough-pass" };
++
++      assert.equal((await post({ ...base, password: "short" })).status, 400);
++      assert.equal((await post({ ...base, username: { $ne: null } })).status, 400);
++      assert.equal((await post(5)).status, 400);
++    });
++
++    test("a taken username is refused, whatever the capital letters", async () => {
++      const r = await api("/signup", { method: "POST", json: { username: alice.username.toUpperCase(), email: `other${tag}@example.test`, password: "long-enough-pass" } });
++      assert.equal(r.status, 409);
++      assert.equal(r.data.user, undefined);
++    });
++
++    test("responses never contain password data", async () => {
++      const login = await api("/login", { method: "POST", json: { username: alice.username, password: alice.password } });
++      const me = await api("/me", { token: login.data.token });
++      for (const body of [login.buf.toString(), me.buf.toString()]) {
++        assert.ok(!/password|hash|\$2[aby]\$/i.test(body.replace(/Login successful/g, "")), body);
++      }
++    });
++
++    test("login checks types, and gives one answer for wrong password and unknown user", async () => {
++      const post = (json) => api("/login", { method: "POST", json });
++      assert.equal((await post({ username: { $ne: null }, password: { $ne: null } })).status, 400);
++      assert.equal((await post({ username: alice.username })).status, 400);
++      assert.equal((await post(null)).status, 400);
++
++      const wrong = await post({ username: alice.username, password: "not-the-password" });
++      const unknown = await post({ username: `zt${tag}nobody`, password: "not-the-password" });
++      assert.equal(wrong.status, 401);
++      assert.equal(unknown.status, 401);
++      assert.deepEqual(wrong.data, unknown.data);
++    });
++
++    test("repeated wrong passwords lock that account's login for a while", async () => {
++      const victim = await makeUser("victim");
++      const attempt = (password) => api("/login", { method: "POST", json: { username: victim.username, password } });
++
++      for (let i = 0; i < 10; i += 1) assert.equal((await attempt("wrong-password")).status, 401);
++
++      const locked = await attempt("wrong-password");
++      assert.equal(locked.status, 429);
++      assert.ok(Number(locked.headers.get("retry-after")) >= 1);
++      assert.equal((await attempt(victim.password)).status, 429, "even the right password waits");
++      assert.equal((await api("/login", { method: "POST", json: { username: alice.username, password: alice.password } })).status, 200, "other accounts unaffected");
++    });
++  });
++
++  describe("tokens", () => {
++    const me = (headers) => api("/me", { headers });
++
++    test("only a well-formed, correctly signed, unexpired token works", async () => {
++      assert.equal((await me({ Authorization: `Bearer ${alice.token}` })).status, 200);
++
++      const expired = jwt.sign({ userId: alice.id }, SECRET, { expiresIn: -60 });
++      const wrongKey = jwt.sign({ userId: alice.id }, "another-secret-that-is-not-ours-123456");
++      const wrongAlg = jwt.sign({ userId: alice.id }, SECRET, { algorithm: "HS512" });
++      const noneAlg = `${Buffer.from('{"alg":"none","typ":"JWT"}').toString("base64url")}.${Buffer.from(JSON.stringify({ userId: alice.id })).toString("base64url")}.`;
++      const badPayload = jwt.sign({ userId: "1 OR 1=1" }, SECRET);
++      const noUser = jwt.sign({ username: "x" }, SECRET);
++
++      assert.equal((await me({})).status, 401);
++      assert.equal((await me({ Authorization: "Basic abc" })).status, 401);
++      assert.equal((await me({ Authorization: "Bearer" })).status, 401);
++      for (const token of [expired, wrongKey, wrongAlg, noneAlg, badPayload, noUser, "garbage", alice.token.slice(0, -3)]) {
++        assert.equal((await me({ Authorization: `Bearer ${token}` })).status, 403, token.slice(0, 25));
++      }
++    });
++
++    test("the socket needs a valid token too", async () => {
++      const attempt = (auth) => new Promise((resolve) => {
++        const socket = io(main.base, { auth, transports: ["websocket"], reconnection: false });
++        sockets.push(socket);
++        socket.on("connect", () => resolve("connected"));
++        socket.on("connect_error", (error) => resolve(error.message));
++      });
++
++      assert.equal(await attempt({}), "No token provided");
++      assert.equal(await attempt({ token: "garbage" }), "Invalid token");
++      assert.equal(await attempt({ token: jwt.sign({ userId: alice.id }, "wrong-secret-wrong-secret-wrong-1234") }), "Invalid token");
++      assert.equal(await attempt({ token: jwt.sign({ userId: "x" }, SECRET) }), "Invalid token");
++    });
++  });
++
++  describe("errors and headers", () => {
++    test("health check shows nothing about the database; the old debug route is gone", async () => {
++      const health = await api("/health");
++      assert.equal(health.status, 200);
++      assert.deepEqual(health.data, { status: "ok" });
++      assert.equal((await api("/db-test")).status, 404);
++    });
++
++    test("bad requests get short JSON errors, never HTML or stack traces", async () => {
++      const badJson = await api("/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{not json" });
++      assert.equal(badJson.status, 400);
++      assert.deepEqual(badJson.data, { message: "Invalid JSON" });
++
++      const tooBig = await api("/login", { method: "POST", json: { username: "a", password: "x".repeat(30000) } });
++      assert.equal(tooBig.status, 413);
++      assert.deepEqual(tooBig.data, { message: "Request is too large" });
++
++      const unknown = await api("/no/such/route");
++      assert.equal(unknown.status, 404);
++      assert.deepEqual(unknown.data, { message: "Not found" });
++
++      for (const r of [badJson, tooBig, unknown]) {
++        assert.match(r.headers.get("content-type"), /application\/json/);
++        assert.ok(!/at .*\.js|node_modules|<html/i.test(r.buf.toString()));
++      }
++    });
++
++    test("security headers are set and the framework isn't advertised", async () => {
++      const r = await api("/health");
++      assert.equal(r.headers.get("x-content-type-options"), "nosniff");
++      assert.equal(r.headers.get("x-frame-options"), "DENY");
++      assert.equal(r.headers.get("referrer-policy"), "no-referrer");
++      assert.equal(r.headers.get("x-powered-by"), null);
++    });
++
++    test("only the configured website may call the API from a browser", async () => {
++      const ok = await raw("/health", { headers: { Origin: "http://localhost:5173" } });
++      assert.equal(ok.headers["access-control-allow-origin"], "http://localhost:5173");
++      const bad = await raw("/health", { headers: { Origin: "https://evil.example" } });
++      assert.equal(bad.headers["access-control-allow-origin"], undefined);
++    });
++
++    test("settings reject non-boolean values", async () => {
++      for (const keepHistory of ["true", 1, null, {}, undefined]) {
++        assert.equal((await api("/settings/history", { method: "PATCH", token: alice.token, json: { keepHistory } })).status, 400);
++      }
++      assert.equal((await api("/settings/history", { method: "PATCH", json: { keepHistory: true } })).status, 401);
++    });
++
++    test("protected routes all require a login", async () => {
++      const routes = [
++        ["GET", "/me"], ["GET", "/conversations"], ["GET", "/ice-servers"], ["GET", "/users/search?id=ABCD2345"],
++        ["GET", "/message-requests/incoming"], ["POST", "/message-requests"], ["POST", "/message-requests/1/respond"],
++        ["POST", "/conversations"], ["POST", "/conversations/1/read"], ["POST", "/conversations/1/images"],
++        ["GET", `/conversations/1/images/${"a".repeat(32)}.jpg`], ["PATCH", "/settings/history"], ["DELETE", "/messages"],
++      ];
++      for (const [method, p] of routes) {
++        const r = await api(p, { method, json: method === "GET" ? undefined : {} });
++        assert.equal(r.status, 401, `${method} ${p}`);
++      }
++    });
++
++    test("user search: needs the exact 8-character ID", async () => {
++      assert.equal((await api(`/users/search?id=${bob.publicId}`, { token: alice.token })).data.user.id, bob.id);
++      for (const id of ["", "short", "A".repeat(9), "%", "a' OR '1'='1"]) {
++        assert.equal((await api(`/users/search?id=${encodeURIComponent(id)}`, { token: alice.token })).status, 400, id);
++      }
++      assert.equal((await api("/users/search?id=ZZZZZZZZ", { token: alice.token })).status, 404);
++    });
++  });
++
++  describe("real-time messages and calls", () => {
++    let sa, sb, sd, sc;
++
++    before(async () => {
++      [sa, sb] = [await connect(alice.token), await connect(bob.token)];
++      [sc, sd] = [await connect(carol.token), await connect(dave.token)];
++      await joinRoom(sa, C1);
++      await joinRoom(sb, C1);
++    });
++
++    test("odd payloads can't crash the server", async () => {
++      const events = ["join_room", "chat_message", "call:invite", "call:answer", "call:ice", "call:end"];
++      const payloads = [null, undefined, 0, "text", [], {}, true, 1e9, { room: {} }, { room: "conversation_1" }, { callId: null }, { callId: {}, candidate: "x" }, { room: "x".repeat(2000) }, [[[]]]];
++      for (const event of events) for (const payload of payloads) sd.emit(event, payload);
++
++      await sleep(700);
++      assert.equal(main.child.exitCode, null, "server still running");
++      assert.equal((await api("/health")).status, 200);
++    });
++
++    test("an oversized message is dropped and the connection is closed", async () => {
++      const big = await connect(carol.token);
++      const closed = new Promise((resolve) => big.once("disconnect", () => resolve(true)));
++      big.emit("chat_message", { room: `conversation_${C2}`, message: "x".repeat(300 * 1024) });
++      assert.equal(await Promise.race([closed, sleep(4000).then(() => false)]), true);
++      assert.equal(main.child.exitCode, null);
++    });
++
++    test("messages longer than 2000 characters are refused; 2000 is fine", async () => {
++      const refused = once(sa, "message_rejected", 1500);
++      const leaked = once(sb, "chat_message", 600);
++      sa.emit("chat_message", { room: `conversation_${C1}`, message: "x".repeat(2001) });
++      assert.equal((await refused).reason, "too_long");
++      assert.equal(await leaked, null);
++
++      const delivered = once(sb, "chat_message", 1500);
++      sa.emit("chat_message", { room: `conversation_${C1}`, message: "y".repeat(2000) });
++      assert.equal((await delivered).message.length, 2000);
++
++      for (const message of ["", "   ", 5, null, {}, []]) {
++        const got = once(sb, "chat_message", 200);
++        sa.emit("chat_message", { room: `conversation_${C1}`, message });
++        assert.equal(await got, null, JSON.stringify(message));
++      }
++    });
++
++    test("an outsider can't see or send into someone else's room", async () => {
++      assert.equal(await joinRoom(sc, C1), null);
++      const got = once(sb, "chat_message", 400);
++      sc.emit("chat_message", { room: `conversation_${C1}`, message: "hi" });
++      assert.equal(await got, null);
++    });
++
++    test("calls: ring, answer, relay setup messages, hang up; outsiders and double calls are refused", async () => {
++      const sdp = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
++      const offer = { type: "offer", sdp };
++      const incoming = once(sb, "call:incoming", 1500);
++      const ringing = once(sa, "call:ringing", 1500);
++      sa.emit("call:invite", { callId: "t1", conversationId: C1, callType: "audio", offer });
++      assert.equal((await incoming).from.username, alice.username);
++      assert.ok(await ringing);
++
++      const outsider = once(sc, "call:ended", 1500);
++      sc.emit("call:invite", { callId: "t2", conversationId: C1, callType: "audio", offer });
++      assert.equal((await outsider).reason, "unavailable");
++
++      const busy = once(sb, "call:ended", 1500);
++      sb.emit("call:invite", { callId: "t3", conversationId: C1, callType: "video", offer });
++      assert.equal((await busy).reason, "busy");
++
++      const answered = once(sa, "call:answered", 1500);
++      sb.emit("call:answer", { callId: "t1", answer: { type: "answer", sdp } });
++      assert.ok(await answered);
++
++      const hijack = once(sa, "call:ended", 400);
++      sc.emit("call:end", { callId: "t1", reason: "hangup" });
++      assert.equal(await hijack, null, "a stranger can't end it");
++
++      const ended = once(sb, "call:ended", 1500);
++      sa.emit("call:end", { callId: "t1", reason: "hangup" });
++      assert.equal((await ended).reason, "hangup");
++    });
++
++    test("sending too fast is slowed down", async () => {
++      const rejected = new Promise((resolve) => sd.once("message_rejected", (d) => resolve(d.reason)));
++      for (let i = 0; i < 45; i += 1) sd.emit("chat_message", { room: `conversation_${C2}`, message: `m${i}` });
++      assert.equal(await Promise.race([rejected, sleep(3000).then(() => "none")]), "too_fast");
++    });
++  });
++
++  describe("start-up checks", () => {
++    test("won't start without JWT_SECRET, and says so without printing any secret", () => {
++      const r = runServerExpectingExit({ JWT_SECRET: "" });
++      assert.equal(r.status, 1);
++      assert.match(r.stdout + r.stderr, /JWT_SECRET is not set/);
++    });
++
++    test("in production a short JWT_SECRET is refused and never printed", () => {
++      const short = "tiny-secret-abc123";
++      const r = runServerExpectingExit({ JWT_SECRET: short, NODE_ENV: "production" });
++      assert.equal(r.status, 1);
++      assert.match(r.stdout + r.stderr, /shorter than 32/);
++      assert.ok(!(r.stdout + r.stderr).includes(short));
++    });
++
++    test("refuses to keep photos inside the public folder", () => {
++      const r = runServerExpectingExit({ JWT_SECRET: SECRET, UPLOAD_DIR: path.join(PUBLIC_DIR, "photos") });
++      assert.notEqual(r.status, 0);
++      assert.match(r.stdout + r.stderr, /must not be inside the public folder/);
++    });
++  });
++
++  // Last on purpose: this uses up the sign-up allowance for this address.
++  describe("rate limits", () => {
++    test("too many sign-up attempts from one address get 429 with Retry-After", async () => {
++      let limited = null;
++
++      for (let i = 0; i < 12 && !limited; i += 1) {
++        const r = await api("/signup", { method: "POST", json: { username: "x" } });
++        if (r.status === 429) limited = r;
++      }
++
++      assert.ok(limited, "a 429 appeared");
++      assert.ok(Number(limited.headers.get("retry-after")) >= 1);
++    });
++  });
++});
+diff --git a/backend/test/security.test.mjs b/backend/test/security.test.mjs
+new file mode 100644
+index 0000000..54592b6
+--- /dev/null
++++ b/backend/test/security.test.mjs
+@@ -0,0 +1,203 @@
++// Unit tests for the security helpers (no database or server needed).
++import { test, describe } from "node:test";
++import assert from "node:assert/strict";
++import jwt from "jsonwebtoken";
++
++process.env.JWT_SECRET = "unit-test-secret-that-is-long-enough-1234567890";
++const security = (await import("../security.js")).default;
++
++const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
++
++describe("validateSignup", () => {
++  const good = { username: "alice_01", email: "Alice@Example.com", password: "correct horse" };
++
++  test("accepts a good sign-up and tidies the email", () => {
++    const result = security.validateSignup(good);
++    assert.equal(result.error, undefined);
++    assert.equal(result.value.email, "alice@example.com");
++  });
++
++  test("rejects missing and non-text values (including injection-style objects)", () => {
++    const bad = [
++      undefined, null, "text", 5, [], {},
++      { ...good, username: undefined },
++      { ...good, email: 123 },
++      { ...good, password: { $ne: null } },
++      { ...good, username: ["a", "b", "c"] },
++      { ...good, username: "" },
++    ];
++    for (const body of bad) assert.ok(security.validateSignup(body).error, JSON.stringify(body));
++  });
++
++  test("rejects bad usernames", () => {
++    for (const username of ["ab", "a".repeat(31), "has space", "semi;colon", "quo'te", "<script>", "émile", "a/b", "../x"]) {
++      assert.ok(security.validateSignup({ ...good, username }).error, username);
++    }
++  });
++
++  test("rejects bad emails", () => {
++    for (const email of ["nope", "a@b", "@x.com", "a b@x.com", "a@x", `${"a".repeat(250)}@x.com`]) {
++      assert.ok(security.validateSignup({ ...good, email }).error, email);
++    }
++  });
++
++  test("password rules: 8 or more characters, at most 72 bytes", () => {
++    assert.ok(security.validateSignup({ ...good, password: "short" }).error);
++    assert.equal(security.validateSignup({ ...good, password: "12345678" }).error, undefined);
++    assert.equal(security.validateSignup({ ...good, password: "a".repeat(72) }).error, undefined);
++    assert.ok(security.validateSignup({ ...good, password: "a".repeat(73) }).error);
++    assert.ok(security.validateSignup({ ...good, password: "é".repeat(37) }).error, "74 bytes");
++  });
++});
++
++describe("validateLogin", () => {
++  test("needs two non-empty strings of sensible length", () => {
++    assert.equal(security.validateLogin({ username: "a", password: "b" }).error, undefined);
++
++    for (const body of [null, {}, { username: "a" }, { password: "b" }, { username: {}, password: "b" },
++      { username: "a", password: ["x"] }, { username: "", password: "b" }, { username: "a".repeat(101), password: "b" },
++      { username: "a", password: "b".repeat(201) }]) {
++      assert.ok(security.validateLogin(body).error, JSON.stringify(body));
++    }
++  });
++});
++
++describe("parseId", () => {
++  test("accepts whole positive numbers only", () => {
++    assert.equal(security.parseId(5), 5);
++    assert.equal(security.parseId("42"), 42);
++    assert.equal(security.parseId(2147483647), 2147483647);
++
++    for (const value of [0, -1, 1.5, NaN, Infinity, "0", "-3", "1.5", "1e3", "0x10", " 5", "5 ", "", "abc",
++      "12345678901", 2147483648, 2 ** 53, null, undefined, true, [5], { id: 5 }, "5; DROP TABLE users"]) {
++      assert.equal(security.parseId(value), null, String(JSON.stringify(value)));
++    }
++  });
++});
++
++describe("login tokens", () => {
++  test("readBearerToken is strict", () => {
++    assert.equal(security.readBearerToken("Bearer abc.def.ghi"), "abc.def.ghi");
++    assert.equal(security.readBearerToken("bearer abc"), "abc");
++
++    for (const header of [undefined, null, "", "Bearer", "Bearer ", "Basic abc", "abc", "Bearer a b", ["Bearer x"], 5]) {
++      assert.equal(security.readBearerToken(header), null, String(header));
++    }
++  });
++
++  test("verifyToken accepts our own tokens and rejects forgeries", () => {
++    const token = security.signToken({ userId: 7, username: "x" });
++    assert.equal(security.verifyToken(token).userId, 7);
++
++    const forged = [
++      jwt.sign({ userId: 7 }, "some-other-secret"),
++      jwt.sign({ userId: 7 }, process.env.JWT_SECRET, { expiresIn: -10 }),
++      jwt.sign({ userId: 7 }, process.env.JWT_SECRET, { algorithm: "HS512" }), // algorithm must be HS256
++      `${Buffer.from('{"alg":"none","typ":"JWT"}').toString("base64url")}.${Buffer.from('{"userId":7}').toString("base64url")}.`,
++      "not.a.token", "", token.slice(0, -2),
++    ];
++    for (const bad of forged) assert.throws(() => security.verifyToken(bad), undefined, bad.slice(0, 30));
++  });
++});
++
++describe("checkConfig", () => {
++  const silence = (fn) => {
++    const warn = console.warn;
++    const warnings = [];
++    console.warn = (message) => warnings.push(message);
++    try { return { result: fn(), warnings }; } finally { console.warn = warn; }
++  };
++
++  test("refuses to run without a JWT_SECRET, and the message holds no secret", () => {
++    assert.throws(() => security.checkConfig({}), /JWT_SECRET is not set/);
++    assert.throws(() => security.checkConfig({ JWT_SECRET: "" }), /JWT_SECRET is not set/);
++  });
++
++  test("a short secret is a warning in development and an error in production", () => {
++    const short = "short-secret-value";
++    const dev = silence(() => security.checkConfig({ JWT_SECRET: short }));
++    assert.equal(dev.warnings.length, 1);
++    assert.ok(!dev.warnings[0].includes(short), "never prints the secret");
++
++    assert.throws(
++      () => security.checkConfig({ JWT_SECRET: short, NODE_ENV: "production" }),
++      (error) => /shorter than 32/.test(error.message) && !error.message.includes(short),
++    );
++  });
++
++  test("a long secret passes quietly", () => {
++    const { warnings } = silence(() => security.checkConfig({ JWT_SECRET: "x".repeat(40), NODE_ENV: "production", CLIENT_ORIGIN: "https://a.example" }));
++    assert.equal(warnings.length, 0);
++  });
++
++  test("warns about a non-https origin in production", () => {
++    const { warnings } = silence(() => security.checkConfig({ JWT_SECRET: "x".repeat(40), NODE_ENV: "production", CLIENT_ORIGIN: "http://a.example" }));
++    assert.equal(warnings.length, 1);
++  });
++});
++
++describe("rate limiting", () => {
++  test("WindowCounter allows up to max, then blocks, then recovers", async () => {
++    const counter = new security.WindowCounter({ windowMs: 80, max: 3 });
++    assert.deepEqual([1, 2, 3].map(() => counter.hit("k").allowed), [true, true, true]);
++    assert.equal(counter.hit("k").allowed, false);
++    assert.ok(counter.hit("k").retryAfter >= 1);
++    assert.equal(counter.hit("other").allowed, true, "keys are independent");
++
++    await sleep(100);
++    assert.equal(counter.hit("k").allowed, true, "new window");
++  });
++
++  test("isBlocked does not count, and reset forgives", () => {
++    const counter = new security.WindowCounter({ windowMs: 1000, max: 2 });
++    assert.equal(counter.isBlocked("k").blocked, false);
++    counter.hit("k"); counter.hit("k");
++    assert.equal(counter.isBlocked("k").blocked, true);
++    counter.reset("k");
++    assert.equal(counter.isBlocked("k").blocked, false);
++  });
++
++  test("rateLimit middleware answers 429 with Retry-After", () => {
++    const limiter = security.rateLimit({ windowMs: 1000, max: 2, message: "slow down" });
++    const run = () => {
++      const res = { headers: {}, setHeader(k, v) { this.headers[k] = v; }, status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } };
++      let passed = false;
++      limiter({ ip: "1.2.3.4" }, res, () => { passed = true; });
++      return { res, passed };
++    };
++
++    assert.equal(run().passed, true);
++    assert.equal(run().passed, true);
++    const blocked = run();
++    assert.equal(blocked.passed, false);
++    assert.equal(blocked.res.code, 429);
++    assert.equal(blocked.res.body.message, "slow down");
++    assert.ok(Number(blocked.res.headers["Retry-After"]) >= 1);
++  });
++
++  test("a flood of different keys cannot grow memory without bound", () => {
++    const counter = new security.WindowCounter({ windowMs: 60000, max: 1 });
++    for (let i = 0; i < 50100; i += 1) counter.hit(`k${i}`);
++    assert.ok(counter.entries.size <= 50000);
++  });
++});
++
++describe("security headers", () => {
++  const run = (req) => {
++    const headers = {};
++    security.securityHeaders(req, { setHeader: (k, v) => (headers[k] = v) }, () => {});
++    return headers;
++  };
++
++  test("sets the basic protections", () => {
++    const headers = run({ secure: false });
++    assert.equal(headers["X-Content-Type-Options"], "nosniff");
++    assert.equal(headers["X-Frame-Options"], "DENY");
++    assert.equal(headers["Referrer-Policy"], "no-referrer");
++    assert.equal(headers["Strict-Transport-Security"], undefined);
++  });
++
++  test("adds HSTS only on https", () => {
++    assert.match(run({ secure: true })["Strict-Transport-Security"], /max-age=/);
++  });
++});
+diff --git a/backend/test/uploads.test.mjs b/backend/test/uploads.test.mjs
+new file mode 100644
+index 0000000..ade4dfe
+--- /dev/null
++++ b/backend/test/uploads.test.mjs
+@@ -0,0 +1,216 @@
++// Unit tests for private photo storage (no database or server needed).
++import { test, describe, before, after } from "node:test";
++import assert from "node:assert/strict";
++import { spawnSync } from "node:child_process";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++
++const backendDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
++const root = fs.mkdtempSync(path.join(os.tmpdir(), "pw-unit-uploads-"));
++process.env.UPLOAD_DIR = path.join(root, "storage");
++process.env.LEGACY_UPLOAD_DIR = path.join(root, "legacy");
++
++const uploads = (await import("../uploads.js")).default;
++
++// ---- tiny valid-looking files, built by hand ----
++const pad = (head, size = 64) => Buffer.concat([head, Buffer.alloc(Math.max(0, size - head.length))]);
++const JPEG = pad(Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
++const PNG = pad(Buffer.concat([
++  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]),
++  Buffer.from("IHDR"),
++]));
++const WEBP = pad(Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WEBPVP8 ")]));
++const NAME = "a".repeat(32) + ".jpg";
++
++after(() => fs.rmSync(root, { recursive: true, force: true }));
++
++describe("detectImageType: judged by the file's own bytes", () => {
++  test("accepts real JPEG, PNG and WebP headers", () => {
++    assert.equal(uploads.detectImageType(JPEG), "jpg");
++    assert.equal(uploads.detectImageType(PNG), "png");
++    assert.equal(uploads.detectImageType(WEBP), "webp");
++  });
++
++  test("rejects other formats and disguised files", () => {
++    const rejected = {
++      gif: pad(Buffer.from("GIF89a")),
++      svg: pad(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')),
++      html: pad(Buffer.from("<!doctype html><script>alert(1)</script>")),
++      php: pad(Buffer.from("<?php system($_GET['x']); ?>")),
++      exe: pad(Buffer.from("MZ")),
++      pdf: pad(Buffer.from("%PDF-1.7")),
++      text: Buffer.from("just some text pretending to be a photo, long enough to pass the size check"),
++      "PNG signature but no IHDR": pad(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
++      "RIFF but not WebP": pad(Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WAVEfmt ")])),
++      "JPEG start with no marker": pad(Buffer.from([0xff, 0xd8, 0xff, 0x00])),
++      empty: Buffer.alloc(0),
++      tiny: Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
++    };
++
++    for (const [label, buffer] of Object.entries(rejected)) {
++      assert.equal(uploads.detectImageType(buffer), null, label);
++    }
++  });
++
++  test("rejects values that are not buffers", () => {
++    for (const value of [null, undefined, "string", 5, {}, [], new Uint8Array(100)]) {
++      assert.equal(uploads.detectImageType(value), null);
++    }
++  });
++});
++
++describe("addresses and paths", () => {
++  test("parseImageUrl only accepts the exact private address shape", () => {
++    assert.deepEqual(uploads.parseImageUrl(`/conversations/12/images/${NAME}`), {
++      conversationId: 12,
++      name: NAME,
++    });
++
++    const bad = [
++      `/uploads/${NAME}`, // the old public address
++      `/uploads/tmp/${NAME}`,
++      `/conversations/0/images/${NAME}`,
++      `/conversations/012/images/${NAME}`,
++      `/conversations/-1/images/${NAME}`,
++      `/conversations/1e3/images/${NAME}`,
++      `/conversations/99999999999/images/${NAME}`,
++      `/conversations/1/images/../${NAME}`,
++      `/conversations/1/images/${NAME}/`,
++      `/conversations/1/images/${NAME}?x=1`,
++      `/conversations/1/images/${NAME}.exe`,
++      `/conversations/1/images/${"A".repeat(32)}.jpg`,
++      `/conversations/1/images/${"a".repeat(31)}.jpg`,
++      `/conversations/1/images/${"a".repeat(32)}.gif`,
++      `http://evil.example/conversations/1/images/${NAME}`,
++      `//evil.example/conversations/1/images/${NAME}`,
++      "", null, undefined, 7, {}, [],
++    ];
++
++    for (const url of bad) assert.equal(uploads.parseImageUrl(url), null, String(url));
++  });
++
++  test("imagePath builds paths inside storage and refuses anything odd", () => {
++    const file = uploads.imagePath(5, NAME);
++    assert.equal(file, path.join(uploads.UPLOAD_ROOT, "5", NAME));
++    assert.ok(file.startsWith(uploads.UPLOAD_ROOT + path.sep));
++    assert.equal(uploads.imagePath(5, NAME, true), path.join(uploads.TEMP_ROOT, "5", NAME));
++
++    const badNames = ["../x.jpg", "..\\x.jpg", `${NAME}\0`, "a/b.jpg", "x.jpg", "", null, `../${NAME}`, `${NAME}/..`];
++    for (const name of badNames) assert.throws(() => uploads.imagePath(5, name), /Invalid/, String(name));
++
++    for (const id of [0, -1, 1.5, NaN, "5", null, "../..", 2 ** 40]) {
++      assert.throws(() => uploads.imagePath(id, NAME), /Invalid/, String(id));
++    }
++  });
++});
++
++describe("saving, finding, moving and deleting", () => {
++  before(() => uploads.ensureUploadDirs());
++
++  test("saveImage writes a private, random-named file and never overwrites", async () => {
++    const name = await uploads.saveImage(7, JPEG, "jpg");
++    assert.match(name, /^[a-f0-9]{32}\.jpg$/);
++
++    const file = uploads.imagePath(7, name);
++    assert.ok(fs.readFileSync(file).equals(JPEG));
++    if (process.platform !== "win32") assert.equal(fs.statSync(file).mode & 0o077, 0, "not readable by others");
++
++    const other = await uploads.saveImage(7, JPEG, "jpg");
++    assert.notEqual(other, name);
++  });
++
++  test("findImage finds saved and temporary photos, only inside their own conversation", async () => {
++    const saved = await uploads.saveImage(8, PNG, "png");
++    const temp = await uploads.saveImage(8, WEBP, "webp", true);
++
++    assert.equal((await uploads.findImage(8, saved)).temp, false);
++    assert.equal((await uploads.findImage(8, temp)).temp, true);
++    assert.equal(await uploads.findImage(9, saved), null, "other conversation");
++    assert.equal(await uploads.findImage(8, "f".repeat(32) + ".jpg"), null, "unknown file");
++    assert.equal(await uploads.findImage(8, "../../x"), null, "bad name");
++    assert.equal(await uploads.findImage("8", saved), null, "id must be a number");
++  });
++
++  test("findImage refuses a symbolic link that points outside storage", async (t) => {
++    const secret = path.join(root, "outside-secret.jpg");
++    fs.writeFileSync(secret, JPEG);
++
++    const dir = path.join(uploads.UPLOAD_ROOT, "10");
++    fs.mkdirSync(dir, { recursive: true });
++    const link = path.join(dir, NAME);
++
++    try {
++      fs.symlinkSync(secret, link);
++    } catch {
++      return t.skip("cannot create symbolic links here");
++    }
++
++    assert.equal(await uploads.findImage(10, NAME), null);
++  });
++
++  test("relocateImage moves a photo between saved and temporary storage", async () => {
++    const name = await uploads.saveImage(11, JPEG, "jpg", true);
++
++    assert.equal(await uploads.relocateImage(11, name, false), true);
++    assert.equal((await uploads.findImage(11, name)).temp, false);
++
++    assert.equal(await uploads.relocateImage(11, name, true), true);
++    assert.equal((await uploads.findImage(11, name)).temp, true);
++
++    assert.equal(await uploads.relocateImage(11, name, true), true, "already there");
++    assert.equal(await uploads.relocateImage(11, "e".repeat(32) + ".jpg", true), false, "missing");
++  });
++
++  test("deleteConversationImages removes everything for those conversations only", async () => {
++    const a = await uploads.saveImage(20, JPEG, "jpg");
++    const b = await uploads.saveImage(20, JPEG, "jpg", true);
++    const keep = await uploads.saveImage(21, JPEG, "jpg");
++
++    await uploads.deleteConversationImages([20, "../..", -5, null, 20.5]);
++
++    assert.equal(await uploads.findImage(20, a), null);
++    assert.equal(await uploads.findImage(20, b), null);
++    assert.ok(await uploads.findImage(21, keep), "other conversation untouched");
++    assert.ok(fs.existsSync(uploads.UPLOAD_ROOT), "storage root untouched");
++  });
++
++  test("cleanTempUploads deletes old temporary photos and keeps fresh ones", async () => {
++    const old = await uploads.saveImage(30, JPEG, "jpg", true);
++    const fresh = await uploads.saveImage(30, JPEG, "jpg", true);
++    const oldFile = uploads.imagePath(30, old, true);
++    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
++    fs.utimesSync(oldFile, twoHoursAgo, twoHoursAgo);
++
++    await uploads.cleanTempUploads();
++
++    assert.equal(await uploads.findImage(30, old), null);
++    assert.ok(await uploads.findImage(30, fresh));
++  });
++});
++
++describe("configuration", () => {
++  test("refuses to store photos inside the public folder", () => {
++    const result = spawnSync(process.execPath, ["-e", 'require("./uploads")'], {
++      cwd: backendDir,
++      env: { ...process.env, UPLOAD_DIR: path.join(backendDir, "public", "photos") },
++      encoding: "utf8",
++    });
++
++    assert.notEqual(result.status, 0);
++    assert.match(result.stderr, /must not be inside the public folder/);
++  });
++
++  test("the default storage folder is not inside the public folder", () => {
++    const result = spawnSync(process.execPath, ["-e", 'const u=require("./uploads");console.log(u.UPLOAD_ROOT)'], {
++      cwd: backendDir,
++      env: { ...process.env, UPLOAD_DIR: "" },
++      encoding: "utf8",
++    });
++
++    assert.equal(result.status, 0, result.stderr);
++    const publicDir = path.join(backendDir, "public");
++    assert.ok(!result.stdout.trim().startsWith(publicDir + path.sep));
++  });
++});
+diff --git a/backend/uploads.js b/backend/uploads.js
+new file mode 100644
+index 0000000..89e7cd0
+--- /dev/null
++++ b/backend/uploads.js
+@@ -0,0 +1,386 @@
++/**
++ * Private photo storage.
++ *
++ * Photos are NOT served from a public folder. They live in UPLOAD_DIR (outside
++ * the web-served `public` folder) and are only readable through
++ * GET /conversations/:id/images/:name, which checks the login token and that
++ * the person belongs to that conversation.
++ *
++ * Layout:  <UPLOAD_DIR>/<conversationId>/<name>        chats that save history
++ *          <UPLOAD_DIR>/tmp/<conversationId>/<name>    chats that don't (deleted after 1 hour)
++ *
++ * The conversation id is part of the path, so a file can only ever be read
++ * through the conversation it was uploaded to.
++ */
++const fs = require("fs");
++const path = require("path");
++const crypto = require("crypto");
++const pool = require("./db");
++
++const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
++const TEMP_MAX_AGE_MS = 60 * 60 * 1000;
++
++const PUBLIC_DIR = path.resolve(__dirname, "public");
++const UPLOAD_ROOT = path.resolve(
++  process.env.UPLOAD_DIR || path.join(__dirname, "storage", "uploads"),
++);
++const TEMP_ROOT = path.join(UPLOAD_ROOT, "tmp");
++
++// The folder the old, public version used. Only read once, to migrate.
++const LEGACY_DIR = path.resolve(
++  process.env.LEGACY_UPLOAD_DIR || path.join(__dirname, "uploads"),
++);
++
++if (UPLOAD_ROOT === PUBLIC_DIR || UPLOAD_ROOT.startsWith(PUBLIC_DIR + path.sep)) {
++  throw new Error("UPLOAD_DIR must not be inside the public folder");
++}
++
++const IMAGE_NAME = /^[a-f0-9]{32}\.(jpg|png|webp)$/;
++const IMAGE_URL =
++  /^\/conversations\/([1-9]\d{0,9})\/images\/([a-f0-9]{32}\.(?:jpg|png|webp))$/;
++
++const MIME_TYPES = {
++  jpg: "image/jpeg",
++  png: "image/png",
++  webp: "image/webp",
++};
++
++/* ---------- Validation ---------- */
++
++function isValidConversationId(id) {
++  return Number.isInteger(id) && id > 0 && id <= 2147483647;
++}
++
++function isValidImageName(name) {
++  return typeof name === "string" && IMAGE_NAME.test(name);
++}
++
++function mimeTypeFor(name) {
++  return MIME_TYPES[name.slice(name.lastIndexOf(".") + 1)];
++}
++
++// Looks at the file's own bytes. The file name and the type the browser
++// reports are never trusted.
++function detectImageType(buffer) {
++  if (!Buffer.isBuffer(buffer) || buffer.length < 32) return null;
++
++  // JPEG: starts with FF D8 FF and a real marker byte
++  if (
++    buffer[0] === 0xff &&
++    buffer[1] === 0xd8 &&
++    buffer[2] === 0xff &&
++    buffer[3] >= 0xc0 &&
++    buffer[3] !== 0xff
++  ) {
++    return "jpg";
++  }
++
++  // PNG: signature, then the IHDR header chunk
++  if (
++    buffer.subarray(0, 8).equals(
++      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
++    ) &&
++    buffer.subarray(12, 16).toString("ascii") === "IHDR"
++  ) {
++    return "png";
++  }
++
++  // WebP: RIFF container holding a VP8 / VP8L / VP8X chunk
++  if (
++    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
++    buffer.subarray(8, 12).toString("ascii") === "WEBP" &&
++    ["VP8 ", "VP8L", "VP8X"].includes(buffer.subarray(12, 16).toString("ascii"))
++  ) {
++    return "webp";
++  }
++
++  return null;
++}
++
++/* ---------- Addresses and paths ---------- */
++
++function imageUrl(conversationId, name) {
++  return `/conversations/${conversationId}/images/${name}`;
++}
++
++// "/conversations/12/images/<name>" -> { conversationId: 12, name }
++function parseImageUrl(url) {
++  const match = typeof url === "string" ? IMAGE_URL.exec(url) : null;
++
++  return match ? { conversationId: Number(match[1]), name: match[2] } : null;
++}
++
++function conversationDir(conversationId, temp) {
++  return path.join(temp ? TEMP_ROOT : UPLOAD_ROOT, String(conversationId));
++}
++
++// Builds a file path only from a validated id and name, and double-checks
++// that it stays inside the storage folder.
++function imagePath(conversationId, name, temp = false) {
++  if (!isValidConversationId(conversationId) || !isValidImageName(name)) {
++    throw new Error("Invalid image reference");
++  }
++
++  const file = path.join(conversationDir(conversationId, temp), name);
++
++  if (!file.startsWith(UPLOAD_ROOT + path.sep)) {
++    throw new Error("Invalid image path");
++  }
++
++  return file;
++}
++
++async function ensureUploadDirs() {
++  await fs.promises.mkdir(TEMP_ROOT, { recursive: true, mode: 0o700 });
++}
++
++/* ---------- Saving, finding, moving, deleting ---------- */
++
++async function saveImage(conversationId, buffer, type, temp = false) {
++  const name = `${crypto.randomBytes(16).toString("hex")}.${type}`;
++  const file = imagePath(conversationId, name, temp);
++
++  await fs.promises.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
++  // "wx": never overwrite an existing file
++  await fs.promises.writeFile(file, buffer, { flag: "wx", mode: 0o600 });
++
++  return name;
++}
++
++// Returns { file, temp } for a photo that exists, otherwise null. Also refuses
++// anything that isn't a plain file inside the storage folder (for example a
++// symbolic link pointing somewhere else).
++async function findImage(conversationId, name) {
++  if (!isValidConversationId(conversationId) || !isValidImageName(name)) {
++    return null;
++  }
++
++  let rootReal;
++
++  try {
++    rootReal = await fs.promises.realpath(UPLOAD_ROOT);
++  } catch {
++    return null;
++  }
++
++  for (const temp of [false, true]) {
++    try {
++      const file = imagePath(conversationId, name, temp);
++      const real = await fs.promises.realpath(file);
++      const stats = await fs.promises.stat(real);
++
++      if (stats.isFile() && real.startsWith(rootReal + path.sep)) {
++        return { file: real, temp };
++      }
++    } catch {
++      // not in this folder
++    }
++  }
++
++  return null;
++}
++
++// Keeps a photo in the folder that matches the chat's history setting.
++async function relocateImage(conversationId, name, toTemp) {
++  const found = await findImage(conversationId, name);
++
++  if (!found) return false;
++  if (found.temp === toTemp) return true;
++
++  const target = imagePath(conversationId, name, toTemp);
++
++  await fs.promises.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
++
++  try {
++    await fs.promises.rename(found.file, target);
++  } catch (error) {
++    if (error.code !== "EXDEV") throw error;
++
++    // Different disks: copy, then remove the original.
++    await fs.promises.copyFile(found.file, target);
++    await fs.promises.unlink(found.file);
++  }
++
++  return true;
++}
++
++// Removes every saved and temporary photo of these conversations.
++async function deleteConversationImages(conversationIds) {
++  for (const id of conversationIds) {
++    if (!isValidConversationId(id)) continue;
++
++    for (const temp of [false, true]) {
++      await fs.promises
++        .rm(conversationDir(id, temp), { recursive: true, force: true })
++        .catch((error) => console.error("Photo delete error:", error.code));
++    }
++  }
++}
++
++/* ---------- Clean-up jobs ---------- */
++
++async function numericDirs(root) {
++  try {
++    const entries = await fs.promises.readdir(root, { withFileTypes: true });
++
++    return entries
++      .filter((entry) => entry.isDirectory() && /^[1-9]\d{0,9}$/.test(entry.name))
++      .map((entry) => entry.name);
++  } catch {
++    return [];
++  }
++}
++
++// Photos from chats that don't save history are removed after an hour.
++async function cleanTempUploads() {
++  const cutoff = Date.now() - TEMP_MAX_AGE_MS;
++
++  for (const dirName of await numericDirs(TEMP_ROOT)) {
++    const dir = path.join(TEMP_ROOT, dirName);
++
++    try {
++      for (const fileName of await fs.promises.readdir(dir)) {
++        const file = path.join(dir, fileName);
++        const stats = await fs.promises.stat(file);
++
++        if (stats.isFile() && stats.mtimeMs < cutoff) {
++          await fs.promises.unlink(file);
++        }
++      }
++
++      await fs.promises.rmdir(dir).catch(() => {}); // only if empty
++    } catch (error) {
++      console.error("Temp photo clean-up error:", error.code);
++    }
++  }
++}
++
++// Photos that were uploaded but never attached to a message (for example a
++// failed send) are removed after an hour.
++async function cleanOrphanUploads() {
++  const cutoff = Date.now() - TEMP_MAX_AGE_MS;
++
++  for (const dirName of await numericDirs(UPLOAD_ROOT)) {
++    const dir = path.join(UPLOAD_ROOT, dirName);
++
++    try {
++      for (const fileName of await fs.promises.readdir(dir)) {
++        if (!isValidImageName(fileName)) continue;
++
++        const file = path.join(dir, fileName);
++        const stats = await fs.promises.stat(file);
++
++        if (!stats.isFile() || stats.mtimeMs > cutoff) continue;
++
++        const used = await pool.query(
++          `SELECT 1 FROM messages WHERE image_url = $1 LIMIT 1`,
++          [imageUrl(Number(dirName), fileName)],
++        );
++
++        if (used.rows.length === 0) await fs.promises.unlink(file);
++      }
++    } catch (error) {
++      console.error("Orphan photo clean-up error:", error.code || error.message);
++    }
++  }
++}
++
++/* ---------- One-time move from the old public folder ---------- */
++
++// Earlier versions stored photos in backend/uploads and served that folder to
++// everyone. This moves the photos that belong to saved messages into private
++// storage and rewrites their addresses. Safe to run on every start.
++async function migrateLegacyUploads() {
++  let legacyFiles;
++
++  try {
++    legacyFiles = await fs.promises.readdir(LEGACY_DIR);
++  } catch {
++    return { moved: 0, missing: 0 };
++  }
++
++  // Temporary photos are meant to disappear anyway.
++  await fs.promises
++    .rm(path.join(LEGACY_DIR, "tmp"), { recursive: true, force: true })
++    .catch(() => {});
++
++  const rows = await pool.query(
++    `SELECT id, room, image_url FROM messages WHERE image_url LIKE '/uploads/%'`,
++  );
++
++  let moved = 0;
++  let missing = 0;
++
++  for (const row of rows.rows) {
++    const name = row.image_url.slice("/uploads/".length);
++    const conversationId = Number(/^conversation_(\d+)$/.exec(row.room)?.[1]);
++
++    if (!isValidImageName(name) || !isValidConversationId(conversationId)) {
++      continue;
++    }
++
++    const source = path.join(LEGACY_DIR, name);
++    const target = imagePath(conversationId, name, false);
++
++    try {
++      await fs.promises.mkdir(path.dirname(target), {
++        recursive: true,
++        mode: 0o700,
++      });
++
++      try {
++        await fs.promises.rename(source, target);
++      } catch (error) {
++        if (error.code !== "EXDEV") throw error;
++
++        await fs.promises.copyFile(source, target);
++        await fs.promises.unlink(source);
++      }
++
++      moved += 1;
++    } catch (error) {
++      if (error.code !== "ENOENT") throw error;
++
++      missing += 1; // the file was already gone
++    }
++
++    await pool.query(`UPDATE messages SET image_url = $2 WHERE id = $1`, [
++      row.id,
++      imageUrl(conversationId, name),
++    ]);
++  }
++
++  const left = legacyFiles.filter((file) => IMAGE_NAME.test(file)).length;
++
++  if (moved || missing || left) {
++    console.log(
++      `Photo storage: moved ${moved} photo(s) to private storage` +
++        (missing ? `, ${missing} were already missing` : "") +
++        (left ? `. ${left} unreferenced file(s) remain in backend/uploads (no longer served)` : ""),
++    );
++  }
++
++  return { moved, missing };
++}
++
++module.exports = {
++  MAX_IMAGE_BYTES,
++  UPLOAD_ROOT,
++  TEMP_ROOT,
++  LEGACY_DIR,
++  isValidConversationId,
++  isValidImageName,
++  mimeTypeFor,
++  detectImageType,
++  imageUrl,
++  parseImageUrl,
++  imagePath,
++  ensureUploadDirs,
++  saveImage,
++  findImage,
++  relocateImage,
++  deleteConversationImages,
++  cleanTempUploads,
++  cleanOrphanUploads,
++  migrateLegacyUploads,
++};
+diff --git a/frontend/package-lock.json b/frontend/package-lock.json
+index dd8c0ee..6310d17 100644
+--- a/frontend/package-lock.json
++++ b/frontend/package-lock.json
+@@ -17,8 +17,635 @@
+         "@types/react": "^19.2.18",
+         "@types/react-dom": "^19.2.7",
+         "@vitejs/plugin-react": "^6.1.1",
++        "jsdom": "^26.1.0",
+         "oxlint": "^1.81.0",
+-        "vite": "^8.3.0"
++        "vite": "^8.3.0",
++        "vitest": "^5.0.4"
++      }
++    },
++    "node_modules/@asamuzakjp/css-color": {
++      "version": "3.2.0",
++      "resolved": "https://registry.npmjs.org/@asamuzakjp/css-color/-/css-color-3.2.0.tgz",
++      "integrity": "sha512-K1A6z8tS3XsmCMM86xoWdn7Fkdn9m6RSVtocUrJYIwZnFVkng/PvkEoWtOWmP+Scc6saYWHWZYbndEEXxl24jw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@csstools/css-calc": "^2.1.3",
++        "@csstools/css-color-parser": "^3.0.9",
++        "@csstools/css-parser-algorithms": "^3.0.4",
++        "@csstools/css-tokenizer": "^3.0.3",
++        "lru-cache": "^10.4.3"
++      }
++    },
++    "node_modules/@csstools/color-helpers": {
++      "version": "5.1.0",
++      "resolved": "https://registry.npmjs.org/@csstools/color-helpers/-/color-helpers-5.1.0.tgz",
++      "integrity": "sha512-S11EXWJyy0Mz5SYvRmY8nJYTFFd1LCNV+7cXyAgQtOOuzb4EsgfqDufL+9esx72/eLhsRdGZwaldu/h+E4t4BA==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/csstools"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/csstools"
++        }
++      ],
++      "license": "MIT-0",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@csstools/css-calc": {
++      "version": "2.1.4",
++      "resolved": "https://registry.npmjs.org/@csstools/css-calc/-/css-calc-2.1.4.tgz",
++      "integrity": "sha512-3N8oaj+0juUw/1H3YwmDDJXCgTB1gKU6Hc/bB502u9zR0q2vd786XJH9QfrKIEgFlZmhZiq6epXl4rHqhzsIgQ==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/csstools"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/csstools"
++        }
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      },
++      "peerDependencies": {
++        "@csstools/css-parser-algorithms": "^3.0.5",
++        "@csstools/css-tokenizer": "^3.0.4"
++      }
++    },
++    "node_modules/@csstools/css-color-parser": {
++      "version": "3.1.0",
++      "resolved": "https://registry.npmjs.org/@csstools/css-color-parser/-/css-color-parser-3.1.0.tgz",
++      "integrity": "sha512-nbtKwh3a6xNVIp/VRuXV64yTKnb1IjTAEEh3irzS+HkKjAOYLTGNb9pmVNntZ8iVBHcWDA2Dof0QtPgFI1BaTA==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/csstools"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/csstools"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "@csstools/color-helpers": "^5.1.0",
++        "@csstools/css-calc": "^2.1.4"
++      },
++      "engines": {
++        "node": ">=18"
++      },
++      "peerDependencies": {
++        "@csstools/css-parser-algorithms": "^3.0.5",
++        "@csstools/css-tokenizer": "^3.0.4"
++      }
++    },
++    "node_modules/@csstools/css-parser-algorithms": {
++      "version": "3.0.5",
++      "resolved": "https://registry.npmjs.org/@csstools/css-parser-algorithms/-/css-parser-algorithms-3.0.5.tgz",
++      "integrity": "sha512-DaDeUkXZKjdGhgYaHNJTV9pV7Y9B3b644jCLs9Upc3VeNGg6LWARAT6O+Q+/COo+2gg/bM5rhpMAtf70WqfBdQ==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/csstools"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/csstools"
++        }
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      },
++      "peerDependencies": {
++        "@csstools/css-tokenizer": "^3.0.4"
++      }
++    },
++    "node_modules/@csstools/css-tokenizer": {
++      "version": "3.0.4",
++      "resolved": "https://registry.npmjs.org/@csstools/css-tokenizer/-/css-tokenizer-3.0.4.tgz",
++      "integrity": "sha512-Vd/9EVDiu6PPJt9yAh6roZP6El1xHrdvIVGjyBsHR0RYwNHgL7FJPyIIW4fANJNG6FtyZfvlRPpFI4ZM/lubvw==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/csstools"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/csstools"
++        }
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/aix-ppc64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/aix-ppc64/-/aix-ppc64-0.28.2.tgz",
++      "integrity": "sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ==",
++      "cpu": [
++        "ppc64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "aix"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/android-arm": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/android-arm/-/android-arm-0.28.2.tgz",
++      "integrity": "sha512-kXXoiPVVGQcnIYGOeaovwOURpniDBpSq4A03qkQ+BMQqtGG6HYap3xne9C1O1yo4TR3qxlCX5IqqmX6fFo2Lqg==",
++      "cpu": [
++        "arm"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/android-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/android-arm64/-/android-arm64-0.28.2.tgz",
++      "integrity": "sha512-5YfKeeI8qWfBZIX+u2xZC3Zlb3Os/gLS2sbEKM+I4ZOcsWmHS2WLysCcQZDAFRslDUU5Oiq44gf6PYN1vGwG5A==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/android-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/android-x64/-/android-x64-0.28.2.tgz",
++      "integrity": "sha512-O387ite7SzUyCcy3JQX4P4bLtEA7bLLkx+esve5JHnyYfNTxcVpXZo9jhdB0lTKN44gztELTdU7nS8Nr16Fs1Q==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/darwin-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/darwin-arm64/-/darwin-arm64-0.28.2.tgz",
++      "integrity": "sha512-n4KqkOQrraxHJcgjM1RvwbigfQKIKJVpM7xp+KsxiyUSrRdIXnt73VhrPAx0fV44hgfmIVKjxMN9J1t5jySVkw==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/darwin-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/darwin-x64/-/darwin-x64-0.28.2.tgz",
++      "integrity": "sha512-uq6suIWYP37qzGddBKPw5QEQPi6HiLGsO7UmkpfyaYNQ3D+rN6w6WfwH+nuqcGXWvawGwxOEroO4YGnFh95azw==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/freebsd-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/freebsd-arm64/-/freebsd-arm64-0.28.2.tgz",
++      "integrity": "sha512-n+I0BTSRIoy+d6RPKnEVwql5UwBJolytvY4mAOIEJorKlqgPII8ix6slVVrfZ5Tnj7glIZvloylbB/EJPMWEXw==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "freebsd"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/freebsd-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/freebsd-x64/-/freebsd-x64-0.28.2.tgz",
++      "integrity": "sha512-78XJTJkvPs0kz2w61301PJjXl4g7q3JqiYMZ/M/yVI73EHBrCRTgkhu9oqG7vPqq+a/yadEW8aD+agKlk5xrmg==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "freebsd"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-arm": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-arm/-/linux-arm-0.28.2.tgz",
++      "integrity": "sha512-XlDnu2q5yoqems+xay6wSAcg9DDD7K9RLKZEBOMZm3ckNpJBvOX20tSfby8KfrrhINDyv9V2YVZKY/SpoGJI8w==",
++      "cpu": [
++        "arm"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-arm64/-/linux-arm64-0.28.2.tgz",
++      "integrity": "sha512-pW4AC0P3it8c7do9MVM4p51FzHzdM/TZrerurgRcHJ2WTa1VQ1CIq18xncfpBJw4ojkiZZrKW2yIBWBP92j6Ug==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-ia32": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-ia32/-/linux-ia32-0.28.2.tgz",
++      "integrity": "sha512-CYbnj78HsIeA+DhgUKgFCfvNsTHFhMMrinUrMZpDXJXKN8T3XViTZ/+wtHeVxEWY8ewSzTFN+nRmSwO2tZaLUQ==",
++      "cpu": [
++        "ia32"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-loong64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-loong64/-/linux-loong64-0.28.2.tgz",
++      "integrity": "sha512-buwkd8nsph4R+ajRvw0qM5Hja/TXQow3ptzWO2EbG/cqcIkHloRrdlBtQlshyYGTNFvfkfJ5tpPLVkY4DtsPfQ==",
++      "cpu": [
++        "loong64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-mips64el": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-mips64el/-/linux-mips64el-0.28.2.tgz",
++      "integrity": "sha512-ZVykbDyk7519VwiNb9Lcj9m8XM6v5V9uKPvrEMkkEedVewf+0itkhahp4HDpgERXhwLRpWFypsGbG/J8s0QjJA==",
++      "cpu": [
++        "mips64el"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-ppc64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-ppc64/-/linux-ppc64-0.28.2.tgz",
++      "integrity": "sha512-CAXl+Dtd9UUuJd8pKKdwh6MLm3MUMiqMPmhZ3tTSXPqfyQ3vDl6R5hZdZ/kYojK4ofXtdfSv1tFq8XzWx3heNQ==",
++      "cpu": [
++        "ppc64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-riscv64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-riscv64/-/linux-riscv64-0.28.2.tgz",
++      "integrity": "sha512-GeXCej4IQtU1B+QlDV8W/RRvbzI3O/Stss+/bCXv4lZls5WGRtu2a+3JkA3i4qIUlMXpcHebWpF8AkJhATowuA==",
++      "cpu": [
++        "riscv64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-s390x": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-s390x/-/linux-s390x-0.28.2.tgz",
++      "integrity": "sha512-3H1weTYZPxt/WOhByszQZybS9w5lKzUn1FDMsgEChbHWQwHYQQRfBxgCcZvPhjHfKyJjIievvMmEUawJrdY9Dg==",
++      "cpu": [
++        "s390x"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.28.2.tgz",
++      "integrity": "sha512-4xTZr1FUmSoQW4XIWmit3tzQrUTZM+N3P0XV8xROKYF50XfI7xeO90+1bZvNwxIufQ9hDQVRJH5YhgPVF8A/HQ==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/netbsd-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/netbsd-arm64/-/netbsd-arm64-0.28.2.tgz",
++      "integrity": "sha512-sSATRjPeDBg3pdgHoQfoYBob11Kk1FGa9lui5RIHZCoCkJa9QKlvl3/vKz2usCmYYjs7ymJR/2Nnsqe+Hjt5nw==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "netbsd"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/netbsd-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/netbsd-x64/-/netbsd-x64-0.28.2.tgz",
++      "integrity": "sha512-lqnzCV+mM0gIADaKihiCg6ifgfU2L3h5E33rNQBN1Y4MaVGnzryzmvvf7UHxprpQdE8hpqLolJ9Rl+SkIRDpyw==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "netbsd"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/openbsd-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/openbsd-arm64/-/openbsd-arm64-0.28.2.tgz",
++      "integrity": "sha512-AL2qJILH7lNjrDmCQDvdxMfAUIv8KMNZOvrwAQ8i8//ntL9FflhOyMJ8OZSMBb8/AWXe3/5v5S20y3zCoZWKoQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "openbsd"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/openbsd-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/openbsd-x64/-/openbsd-x64-0.28.2.tgz",
++      "integrity": "sha512-QtiuPytchRyC4rwUKhexJdQKvDuZ6hWloi3igqPQNUJCS1/v9EiO3UTOXR6A3FoMo4fnAKbWJdqaIwhOzh8qEw==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "openbsd"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/openharmony-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/openharmony-arm64/-/openharmony-arm64-0.28.2.tgz",
++      "integrity": "sha512-WkhYDmpTjLvGlScA1rwjRUmhl4k8oXR3cIbtqWmELgU/dFeHHlEllxDvdWcNJV9rbzCexB5vz8gtNewWLgCT7Q==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "openharmony"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/sunos-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/sunos-x64/-/sunos-x64-0.28.2.tgz",
++      "integrity": "sha512-GPMSkTOtMnv2U2F8gxe4Io6qmVs+YKyp832Etqqxr0hFngmXQ3rzwytelm3GIn7T4VviRUlf3sOgBOiTdvaf7g==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "sunos"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/win32-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/win32-arm64/-/win32-arm64-0.28.2.tgz",
++      "integrity": "sha512-PIhhEkE9uPBleRBrQEJpUn7MBnibZzbGzYWPmY3x+YoVg/95zbjB4CxPPOQ8l5tYYM4mMaCthF8/1DIfBQQyWQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/win32-ia32": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/win32-ia32/-/win32-ia32-0.28.2.tgz",
++      "integrity": "sha512-YmJbfTlvU7Sdn9BB+4PRES4oB6pxgS37MAONj+hBr/cpXS1aBPKXxNnDbu+QCWPj0o9dgyxeq79g6c5P8KeuYA==",
++      "cpu": [
++        "ia32"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/win32-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/win32-x64/-/win32-x64-0.28.2.tgz",
++      "integrity": "sha512-5ebpxr3nWMzrL/rnUI755Jkuee0bHL/Gq0WTF9lvcpv73wAp5eu8MfBUgWK9bhWvZjj7yX8etf/8tI8Ney695g==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "peer": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@jridgewell/resolve-uri": {
++      "version": "3.1.2",
++      "resolved": "https://registry.npmjs.org/@jridgewell/resolve-uri/-/resolve-uri-3.1.2.tgz",
++      "integrity": "sha512-bRISgCIjP20/tbWSPWMEi54QVPRZExkuD9lJL+UIxUKtwVJA8wW1Trb1jMs1RFXo1CBTNZ/5hpC9QvmKWdopKw==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/@jridgewell/sourcemap-codec": {
++      "version": "1.6.0",
++      "resolved": "https://registry.npmjs.org/@jridgewell/sourcemap-codec/-/sourcemap-codec-1.6.0.tgz",
++      "integrity": "sha512-T7jf+5zgsZHwNJ4lvQ7/aezbyk0nNX+zJVWpmHA7VYsEx7a7qr5Rg5IbtJFqkgze5Y2sruq1RUY8Q837Od7iFw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@jridgewell/trace-mapping": {
++      "version": "0.3.31",
++      "resolved": "https://registry.npmjs.org/@jridgewell/trace-mapping/-/trace-mapping-0.3.31.tgz",
++      "integrity": "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/resolve-uri": "^3.1.0",
++        "@jridgewell/sourcemap-codec": "^1.4.14"
+       }
+     },
+     "node_modules/@oxc-project/types": {
+@@ -622,6 +1249,31 @@
+       "integrity": "sha512-9BCxFwvbGg/RsZK9tjXd8s4UcwR0MWeFQ1XEKIQVVvAGJyINdrqKMcTRyLoK8Rse1GjzLV9cwjWV1olXRWEXVA==",
+       "license": "MIT"
+     },
++    "node_modules/@types/chai": {
++      "version": "5.2.3",
++      "resolved": "https://registry.npmjs.org/@types/chai/-/chai-5.2.3.tgz",
++      "integrity": "sha512-Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/deep-eql": "*",
++        "assertion-error": "^2.0.1"
++      }
++    },
++    "node_modules/@types/deep-eql": {
++      "version": "4.0.2",
++      "resolved": "https://registry.npmjs.org/@types/deep-eql/-/deep-eql-4.0.2.tgz",
++      "integrity": "sha512-c9h9dVVMigMPc4bwTvC5dxqtqJZwQPePsWjPlpSOnojbor6pGqdk541lfA7AqFQr5pB1BRdq0juY9db81BwyFw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/estree": {
++      "version": "1.0.9",
++      "resolved": "https://registry.npmjs.org/@types/estree/-/estree-1.0.9.tgz",
++      "integrity": "sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/@types/react": {
+       "version": "19.3.0",
+       "resolved": "https://registry.npmjs.org/@types/react/-/react-19.3.0.tgz",
+@@ -672,6 +1324,74 @@
+         }
+       }
+     },
++    "node_modules/@vitest/mocker": {
++      "version": "5.0.4",
++      "resolved": "https://registry.npmjs.org/@vitest/mocker/-/mocker-5.0.4.tgz",
++      "integrity": "sha512-tqAlrYWce4iUxhr3ncNohejtCTOcHeE8XWrSNZY3OhPoDn01yeGv+gnaBy64ATp7o6pb03eIbBAjzmibpc9vIQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/trace-mapping": "0.3.31",
++        "@vitest/spy": "5.0.4",
++        "estree-walker": "^3.0.3",
++        "magic-string": "^1.4.3"
++      },
++      "funding": {
++        "url": "https://opencollective.com/vitest"
++      },
++      "peerDependencies": {
++        "msw": "^2.4.9 || ^3.0.0",
++        "vite": "^6.0.0 || ^7.0.0 || ^8.0.0"
++      },
++      "peerDependenciesMeta": {
++        "msw": {
++          "optional": true
++        },
++        "vite": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/@vitest/spy": {
++      "version": "5.0.4",
++      "resolved": "https://registry.npmjs.org/@vitest/spy/-/spy-5.0.4.tgz",
++      "integrity": "sha512-MZKk/gSkm2q+ICobMxCpH1mA+cCAWm8WV7UhxlqGjq/sJ3AGc1BqFOs5CRVXxH78wQtme9q/NAAgBquj4AcyMw==",
++      "dev": true,
++      "license": "MIT",
++      "funding": {
++        "url": "https://opencollective.com/vitest"
++      }
++    },
++    "node_modules/agent-base": {
++      "version": "7.1.4",
++      "resolved": "https://registry.npmjs.org/agent-base/-/agent-base-7.1.4.tgz",
++      "integrity": "sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">= 14"
++      }
++    },
++    "node_modules/assertion-error": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/assertion-error/-/assertion-error-2.0.1.tgz",
++      "integrity": "sha512-Izi8RQcffqCeNVgFigKli1ssklIbpHnCYc6AknXGYoB6grJqyeby7jv12JUQgmTAnIDnbck1uxksT4dzN3PWBA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=12"
++      }
++    },
++    "node_modules/chai": {
++      "version": "6.3.0",
++      "resolved": "https://registry.npmjs.org/chai/-/chai-6.3.0.tgz",
++      "integrity": "sha512-XWAtwJ6OHO+tj0EKCs0Y2UamnyOxseZWltU4x2U2wh8g4AigdjwvtUjvLP2tqkA/avxHEtzxNaqGq/YGNwckKg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
+     "node_modules/cookie": {
+       "version": "1.1.1",
+       "resolved": "https://registry.npmjs.org/cookie/-/cookie-1.1.1.tgz",
+@@ -685,6 +1405,20 @@
+         "url": "https://opencollective.com/express"
+       }
+     },
++    "node_modules/cssstyle": {
++      "version": "4.6.0",
++      "resolved": "https://registry.npmjs.org/cssstyle/-/cssstyle-4.6.0.tgz",
++      "integrity": "sha512-2z+rWdzbbSZv6/rhtvzvqeZQHrBaqgogqt85sqFNbabZOuFbCVFb8kPeEtZjiKkbrm395irpNKiYeFeLiQnFPg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@asamuzakjp/css-color": "^3.2.0",
++        "rrweb-cssom": "^0.8.0"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
+     "node_modules/csstype": {
+       "version": "3.2.3",
+       "resolved": "https://registry.npmjs.org/csstype/-/csstype-3.2.3.tgz",
+@@ -692,6 +1426,20 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/data-urls": {
++      "version": "5.0.0",
++      "resolved": "https://registry.npmjs.org/data-urls/-/data-urls-5.0.0.tgz",
++      "integrity": "sha512-ZYP5VBHshaDAiVZxjbRVcFJpc+4xGgT0bK3vzy1HLN8jTO975HEbuYzZJcHoQEY5K1a0z8YayJkyVETa08eNTg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "whatwg-mimetype": "^4.0.0",
++        "whatwg-url": "^14.0.0"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
+     "node_modules/debug": {
+       "version": "4.4.3",
+       "resolved": "https://registry.npmjs.org/debug/-/debug-4.4.3.tgz",
+@@ -709,6 +1457,13 @@
+         }
+       }
+     },
++    "node_modules/decimal.js": {
++      "version": "10.6.0",
++      "resolved": "https://registry.npmjs.org/decimal.js/-/decimal.js-10.6.0.tgz",
++      "integrity": "sha512-YpgQiITW3JXGntzdUmyUR1V812Hn8T1YVXhCu+wO3OpS4eU9l4YdD3qjyiKdV6mvV29zapkMeD390UVEf2lkUg==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/detect-libc": {
+       "version": "2.1.2",
+       "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-2.1.2.tgz",
+@@ -741,6 +1496,90 @@
+         "node": ">=10.0.0"
+       }
+     },
++    "node_modules/entities": {
++      "version": "6.0.1",
++      "resolved": "https://registry.npmjs.org/entities/-/entities-6.0.1.tgz",
++      "integrity": "sha512-aN97NXWF6AWBTahfVOIrB/NShkzi5H7F9r1s9mD3cDj4Ko5f2qhhVoYMibXF7GlLveb/D2ioWay8lxI97Ven3g==",
++      "dev": true,
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=0.12"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/entities?sponsor=1"
++      }
++    },
++    "node_modules/es-module-lexer": {
++      "version": "2.3.2",
++      "resolved": "https://registry.npmjs.org/es-module-lexer/-/es-module-lexer-2.3.2.tgz",
++      "integrity": "sha512-poHGpORABojJJucnV9KbOavETW8lBVnphkW77ER5/BQ5Fz7oXSoCNek7IH3vR5nRjdsEz926ibFYX8KtLQmdyw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/esbuild": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz",
++      "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA==",
++      "dev": true,
++      "hasInstallScript": true,
++      "license": "MIT",
++      "optional": true,
++      "peer": true,
++      "bin": {
++        "esbuild": "bin/esbuild"
++      },
++      "engines": {
++        "node": ">=18"
++      },
++      "optionalDependencies": {
++        "@esbuild/aix-ppc64": "0.28.2",
++        "@esbuild/android-arm": "0.28.2",
++        "@esbuild/android-arm64": "0.28.2",
++        "@esbuild/android-x64": "0.28.2",
++        "@esbuild/darwin-arm64": "0.28.2",
++        "@esbuild/darwin-x64": "0.28.2",
++        "@esbuild/freebsd-arm64": "0.28.2",
++        "@esbuild/freebsd-x64": "0.28.2",
++        "@esbuild/linux-arm": "0.28.2",
++        "@esbuild/linux-arm64": "0.28.2",
++        "@esbuild/linux-ia32": "0.28.2",
++        "@esbuild/linux-loong64": "0.28.2",
++        "@esbuild/linux-mips64el": "0.28.2",
++        "@esbuild/linux-ppc64": "0.28.2",
++        "@esbuild/linux-riscv64": "0.28.2",
++        "@esbuild/linux-s390x": "0.28.2",
++        "@esbuild/linux-x64": "0.28.2",
++        "@esbuild/netbsd-arm64": "0.28.2",
++        "@esbuild/netbsd-x64": "0.28.2",
++        "@esbuild/openbsd-arm64": "0.28.2",
++        "@esbuild/openbsd-x64": "0.28.2",
++        "@esbuild/openharmony-arm64": "0.28.2",
++        "@esbuild/sunos-x64": "0.28.2",
++        "@esbuild/win32-arm64": "0.28.2",
++        "@esbuild/win32-ia32": "0.28.2",
++        "@esbuild/win32-x64": "0.28.2"
++      }
++    },
++    "node_modules/estree-walker": {
++      "version": "3.0.3",
++      "resolved": "https://registry.npmjs.org/estree-walker/-/estree-walker-3.0.3.tgz",
++      "integrity": "sha512-7RUKfXgSMMkzt6ZuXmqapOurLGPPfgj6l9uRZ7lRGolvk0y2yocc35LdcxKC5PQZdn2DMqioAQ2NoWcrTKmm6g==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/estree": "^1.0.0"
++      }
++    },
++    "node_modules/expect-type": {
++      "version": "1.4.0",
++      "resolved": "https://registry.npmjs.org/expect-type/-/expect-type-1.4.0.tgz",
++      "integrity": "sha512-KfYbmpRm0VbLjEvVa9yGwCi9GI34xvi7A/HXYWQO65CSD2u3MczUJSuwXKFIxlGsgBQizV9q5J9NHj4VG0n+pA==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=12.0.0"
++      }
++    },
+     "node_modules/fdir": {
+       "version": "6.5.0",
+       "resolved": "https://registry.npmjs.org/fdir/-/fdir-6.5.0.tgz",
+@@ -774,6 +1613,107 @@
+         "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
+       }
+     },
++    "node_modules/html-encoding-sniffer": {
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/html-encoding-sniffer/-/html-encoding-sniffer-4.0.0.tgz",
++      "integrity": "sha512-Y22oTqIU4uuPgEemfz7NDJz6OeKf12Lsu+QC+s3BVpda64lTiMYCyGwg5ki4vFxkMwQdeZDl2adZoqUgdFuTgQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "whatwg-encoding": "^3.1.1"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/http-proxy-agent": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/http-proxy-agent/-/http-proxy-agent-7.0.2.tgz",
++      "integrity": "sha512-T1gkAiYYDWYx3V5Bmyu7HcfcvL7mUrTWiM6yOfa3PIphViJ/gFPbvidQ+veqSOHci/PxBcDabeUNCzpOODJZig==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "agent-base": "^7.1.0",
++        "debug": "^4.3.4"
++      },
++      "engines": {
++        "node": ">= 14"
++      }
++    },
++    "node_modules/https-proxy-agent": {
++      "version": "7.0.6",
++      "resolved": "https://registry.npmjs.org/https-proxy-agent/-/https-proxy-agent-7.0.6.tgz",
++      "integrity": "sha512-vK9P5/iUfdl95AI+JVyUuIcVtd4ofvtrOr3HNtM2yxC9bnMbEdp3x01OhQNnjb8IJYi38VlTE3mBXwcfvywuSw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "agent-base": "^7.1.2",
++        "debug": "4"
++      },
++      "engines": {
++        "node": ">= 14"
++      }
++    },
++    "node_modules/iconv-lite": {
++      "version": "0.6.3",
++      "resolved": "https://registry.npmjs.org/iconv-lite/-/iconv-lite-0.6.3.tgz",
++      "integrity": "sha512-4fCk79wshMdzMp2rH06qWrJE4iolqLhCUH+OiuIgU++RB0+94NlDL81atO7GX55uUKueo0txHNtvEyI6D7WdMw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "safer-buffer": ">= 2.1.2 < 3.0.0"
++      },
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/is-potential-custom-element-name": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/is-potential-custom-element-name/-/is-potential-custom-element-name-1.0.1.tgz",
++      "integrity": "sha512-bCYeRA2rVibKZd+s2625gGnGF/t7DSqDs4dP7CrLA1m7jKWz6pps0LpYLJN8Q64HtmPKJ1hrN3nzPNKFEKOUiQ==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/jsdom": {
++      "version": "26.1.0",
++      "resolved": "https://registry.npmjs.org/jsdom/-/jsdom-26.1.0.tgz",
++      "integrity": "sha512-Cvc9WUhxSMEo4McES3P7oK3QaXldCfNWp7pl2NNeiIFlCoLr3kfq9kb1fxftiwk1FLV7CvpvDfonxtzUDeSOPg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "cssstyle": "^4.2.1",
++        "data-urls": "^5.0.0",
++        "decimal.js": "^10.5.0",
++        "html-encoding-sniffer": "^4.0.0",
++        "http-proxy-agent": "^7.0.2",
++        "https-proxy-agent": "^7.0.6",
++        "is-potential-custom-element-name": "^1.0.1",
++        "nwsapi": "^2.2.16",
++        "parse5": "^7.2.1",
++        "rrweb-cssom": "^0.8.0",
++        "saxes": "^6.0.0",
++        "symbol-tree": "^3.2.4",
++        "tough-cookie": "^5.1.1",
++        "w3c-xmlserializer": "^5.0.0",
++        "webidl-conversions": "^7.0.0",
++        "whatwg-encoding": "^3.1.1",
++        "whatwg-mimetype": "^4.0.0",
++        "whatwg-url": "^14.1.1",
++        "ws": "^8.18.0",
++        "xml-name-validator": "^5.0.0"
++      },
++      "engines": {
++        "node": ">=18"
++      },
++      "peerDependencies": {
++        "canvas": "^3.0.0"
++      },
++      "peerDependenciesMeta": {
++        "canvas": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/lightningcss": {
+       "version": "1.33.0",
+       "resolved": "https://registry.npmjs.org/lightningcss/-/lightningcss-1.33.0.tgz",
+@@ -1035,6 +1975,23 @@
+         "url": "https://opencollective.com/parcel"
+       }
+     },
++    "node_modules/lru-cache": {
++      "version": "10.4.3",
++      "resolved": "https://registry.npmjs.org/lru-cache/-/lru-cache-10.4.3.tgz",
++      "integrity": "sha512-JNAzZcXrCt42VGLuYz0zfAzDfAvJWW6AfYlDBQyDV5DClI2m5sAmK+OIO7s59XfsRsWHp02jAJrRadPRGTt6SQ==",
++      "dev": true,
++      "license": "ISC"
++    },
++    "node_modules/magic-string": {
++      "version": "1.4.3",
++      "resolved": "https://registry.npmjs.org/magic-string/-/magic-string-1.4.3.tgz",
++      "integrity": "sha512-z12OxmaPGE0F4xlpGdjuAUckipLpQlTAuAmyGhNoD7ODpYUzvDfvtxUbjM/jwznyP178oju/KDdyi220wNJ0RQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/sourcemap-codec": "^1.6.0"
++      }
++    },
+     "node_modules/ms": {
+       "version": "2.1.3",
+       "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+@@ -1060,6 +2017,27 @@
+         "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
+       }
+     },
++    "node_modules/nwsapi": {
++      "version": "2.2.28",
++      "resolved": "https://registry.npmjs.org/nwsapi/-/nwsapi-2.2.28.tgz",
++      "integrity": "sha512-IlVB7OS7qrOsVYlpnFIkETjMwT9jwvmocJmmM+GZU/PAB3uGi9Ezd7vcWhWBUnSc0ya4ppmQITOyP1ez9gg8cg==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/obug": {
++      "version": "3.0.0",
++      "resolved": "https://registry.npmjs.org/obug/-/obug-3.0.0.tgz",
++      "integrity": "sha512-5vvB5+W7ePv+p3uqxi+RcW1XAzLW0/hxt3/4X4Lc4qHudzOhmBiBwOY6DRob4WnanAEGvNcLjF+KNOufrUoEQw==",
++      "dev": true,
++      "funding": [
++        "https://github.com/sponsors/sxzz",
++        "https://opencollective.com/debug"
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=12.20.0"
++      }
++    },
+     "node_modules/oxlint": {
+       "version": "1.87.0",
+       "resolved": "https://registry.npmjs.org/oxlint/-/oxlint-1.87.0.tgz",
+@@ -1109,6 +2087,19 @@
+         }
+       }
+     },
++    "node_modules/parse5": {
++      "version": "7.3.0",
++      "resolved": "https://registry.npmjs.org/parse5/-/parse5-7.3.0.tgz",
++      "integrity": "sha512-IInvU7fabl34qmi9gY8XOVxhYyMyuH2xUNpb2q8/Y+7552KlejkRvqvD19nMoUW/uQGGbqNpA6Tufu5FL5BZgw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "entities": "^6.0.0"
++      },
++      "funding": {
++        "url": "https://github.com/inikulin/parse5?sponsor=1"
++      }
++    },
+     "node_modules/picocolors": {
+       "version": "1.1.1",
+       "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
+@@ -1158,6 +2149,16 @@
+         "node": "^10 || ^12 || >=14"
+       }
+     },
++    "node_modules/punycode": {
++      "version": "2.3.1",
++      "resolved": "https://registry.npmjs.org/punycode/-/punycode-2.3.1.tgz",
++      "integrity": "sha512-vYt7UD1U9Wg6138shLtLOvdAu+8DsC/ilFtEVHcH+wydcSpNE20AfSOduf6MkRFahL5FY7X1oU7nKVZFtfq8Fg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6"
++      }
++    },
+     "node_modules/react": {
+       "version": "19.3.0",
+       "resolved": "https://registry.npmjs.org/react/-/react-19.3.0.tgz",
+@@ -1251,6 +2252,33 @@
+         "@rolldown/binding-win32-x64-msvc": "1.2.13"
+       }
+     },
++    "node_modules/rrweb-cssom": {
++      "version": "0.8.0",
++      "resolved": "https://registry.npmjs.org/rrweb-cssom/-/rrweb-cssom-0.8.0.tgz",
++      "integrity": "sha512-guoltQEx+9aMf2gDZ0s62EcV8lsXR+0w8915TC3ITdn2YueuNjdAYh/levpU9nFaoChh9RUS5ZdQMrKfVEN9tw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/safer-buffer": {
++      "version": "2.1.2",
++      "resolved": "https://registry.npmjs.org/safer-buffer/-/safer-buffer-2.1.2.tgz",
++      "integrity": "sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/saxes": {
++      "version": "6.0.0",
++      "resolved": "https://registry.npmjs.org/saxes/-/saxes-6.0.0.tgz",
++      "integrity": "sha512-xAg7SOnEhrm5zI3puOOKyy1OMcMlIJZYNJY7xLBwSze0UjhPLnWfj2GF2EpT0jmzaJKIWKHLsaSSajf35bcYnA==",
++      "dev": true,
++      "license": "ISC",
++      "dependencies": {
++        "xmlchars": "^2.2.0"
++      },
++      "engines": {
++        "node": ">=v12.22.7"
++      }
++    },
+     "node_modules/scheduler": {
+       "version": "0.28.0",
+       "resolved": "https://registry.npmjs.org/scheduler/-/scheduler-0.28.0.tgz",
+@@ -1301,6 +2329,40 @@
+         "node": ">=0.10.0"
+       }
+     },
++    "node_modules/std-env": {
++      "version": "4.3.0",
++      "resolved": "https://registry.npmjs.org/std-env/-/std-env-4.3.0.tgz",
++      "integrity": "sha512-OtU/EgQ1kIm5KwqQpBC6ZEMXrZRui11w8zgfTWp8cdO9B8OaPsbA8bTHO2P+HNo1VlUTGMVBwPhydu6poeXiag==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/symbol-tree": {
++      "version": "3.2.4",
++      "resolved": "https://registry.npmjs.org/symbol-tree/-/symbol-tree-3.2.4.tgz",
++      "integrity": "sha512-9QNk5KwDF+Bvz+PyObkmSYjI5ksVUYtjW7AU22r2NKcfLJcXp96hkDWU3+XndOsUb+AQ9QhfzfCT2O+CNWT5Tw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/tinybench": {
++      "version": "6.2.2",
++      "resolved": "https://registry.npmjs.org/tinybench/-/tinybench-6.2.2.tgz",
++      "integrity": "sha512-nIZ2N2dFpjBsg2hgitKu7mA+FvsIJuGJOwysRngmVRRmWgR/UyPjwJj8c/fT/dhm8EkHnF5EOogRf+0Z2qrimA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=20.0.0"
++      }
++    },
++    "node_modules/tinyexec": {
++      "version": "1.3.1",
++      "resolved": "https://registry.npmjs.org/tinyexec/-/tinyexec-1.3.1.tgz",
++      "integrity": "sha512-GCvB3aoys96IuDFBMcTB46JOR6mdMtAToqwiW8JlWhsoh1mhHi/xn9ss/Dg7N555GiJyEt2qzoG/NHCwM6h1EA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
+     "node_modules/tinyglobby": {
+       "version": "0.2.17",
+       "resolved": "https://registry.npmjs.org/tinyglobby/-/tinyglobby-0.2.17.tgz",
+@@ -1318,6 +2380,52 @@
+         "url": "https://github.com/sponsors/SuperchupuDev"
+       }
+     },
++    "node_modules/tldts": {
++      "version": "6.1.86",
++      "resolved": "https://registry.npmjs.org/tldts/-/tldts-6.1.86.tgz",
++      "integrity": "sha512-WMi/OQ2axVTf/ykqCQgXiIct+mSQDFdH2fkwhPwgEwvJ1kSzZRiinb0zF2Xb8u4+OqPChmyI6MEu4EezNJz+FQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "tldts-core": "^6.1.86"
++      },
++      "bin": {
++        "tldts": "bin/cli.js"
++      }
++    },
++    "node_modules/tldts-core": {
++      "version": "6.1.86",
++      "resolved": "https://registry.npmjs.org/tldts-core/-/tldts-core-6.1.86.tgz",
++      "integrity": "sha512-Je6p7pkk+KMzMv2XXKmAE3McmolOQFdxkKw0R8EYNr7sELW46JqnNeTX8ybPiQgvg1ymCoF8LXs5fzFaZvJPTA==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/tough-cookie": {
++      "version": "5.1.2",
++      "resolved": "https://registry.npmjs.org/tough-cookie/-/tough-cookie-5.1.2.tgz",
++      "integrity": "sha512-FVDYdxtnj0G6Qm/DhNPSb8Ju59ULcup3tuJxkFb5K8Bv2pUXILbf0xZWU8PX8Ov19OXljbUyveOFwRMwkXzO+A==",
++      "dev": true,
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "tldts": "^6.1.32"
++      },
++      "engines": {
++        "node": ">=16"
++      }
++    },
++    "node_modules/tr46": {
++      "version": "5.1.1",
++      "resolved": "https://registry.npmjs.org/tr46/-/tr46-5.1.1.tgz",
++      "integrity": "sha512-hdF5ZgjTqgAntKkklYw0R03MG2x/bSzTtkxmIRw/sTNV8YXsCJ1tfLAX23lhxhHJlEf3CRCOCGGWw3vI3GaSPw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "punycode": "^2.3.1"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
+     "node_modules/vite": {
+       "version": "8.3.4",
+       "resolved": "https://registry.npmjs.org/vite/-/vite-8.3.4.tgz",
+@@ -1396,6 +2504,163 @@
+         }
+       }
+     },
++    "node_modules/vitest": {
++      "version": "5.0.4",
++      "resolved": "https://registry.npmjs.org/vitest/-/vitest-5.0.4.tgz",
++      "integrity": "sha512-z0WxZRV2Sg48wF0FSgMq3TFG8JS38/Qr96vZVZdX6+Em9raQTvnXQvdTFJe2m3rfyJnEHeHQ/snceIdi8D1pVg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/chai": "^5.2.2",
++        "@vitest/mocker": "5.0.4",
++        "chai": "^6.3.0",
++        "es-module-lexer": "^2.3.2",
++        "expect-type": "^1.4.0",
++        "magic-string": "^1.4.3",
++        "obug": "^3.0.0",
++        "picomatch": "^4.0.7",
++        "std-env": "^4.3.0",
++        "tinybench": "^6.2.2",
++        "tinyexec": "^1.3.1",
++        "tinyglobby": "^0.2.17",
++        "why-is-node-running": "3.2.1"
++      },
++      "bin": {
++        "vitest": "vitest.mjs"
++      },
++      "engines": {
++        "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/vitest"
++      },
++      "peerDependencies": {
++        "@edge-runtime/vm": "*",
++        "@opentelemetry/api": "^1.9.0",
++        "@types/node": "^22.0.0 || >=24.0.0",
++        "@vitest/browser-playwright": "5.0.4",
++        "@vitest/browser-preview": "5.0.4",
++        "@vitest/browser-webdriverio": "^5.0.0-beta.5 || >=5.0.0",
++        "@vitest/coverage-istanbul": "5.0.4",
++        "@vitest/coverage-v8": "5.0.4",
++        "@vitest/ui": "5.0.4",
++        "happy-dom": "*",
++        "jsdom": "*",
++        "vite": "^6.4.0 || ^7.0.0 || ^8.0.0"
++      },
++      "peerDependenciesMeta": {
++        "@edge-runtime/vm": {
++          "optional": true
++        },
++        "@opentelemetry/api": {
++          "optional": true
++        },
++        "@types/node": {
++          "optional": true
++        },
++        "@vitest/browser-playwright": {
++          "optional": true
++        },
++        "@vitest/browser-preview": {
++          "optional": true
++        },
++        "@vitest/browser-webdriverio": {
++          "optional": true
++        },
++        "@vitest/coverage-istanbul": {
++          "optional": true
++        },
++        "@vitest/coverage-v8": {
++          "optional": true
++        },
++        "@vitest/ui": {
++          "optional": true
++        },
++        "happy-dom": {
++          "optional": true
++        },
++        "jsdom": {
++          "optional": true
++        },
++        "vite": {
++          "optional": false
++        }
++      }
++    },
++    "node_modules/w3c-xmlserializer": {
++      "version": "5.0.0",
++      "resolved": "https://registry.npmjs.org/w3c-xmlserializer/-/w3c-xmlserializer-5.0.0.tgz",
++      "integrity": "sha512-o8qghlI8NZHU1lLPrpi2+Uq7abh4GGPpYANlalzWxyWteJOCsr/P+oPBA49TOLu5FTZO4d3F9MnWJfiMo4BkmA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "xml-name-validator": "^5.0.0"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/webidl-conversions": {
++      "version": "7.0.0",
++      "resolved": "https://registry.npmjs.org/webidl-conversions/-/webidl-conversions-7.0.0.tgz",
++      "integrity": "sha512-VwddBukDzu71offAQR975unBIGqfKZpM+8ZX6ySk8nYhVoo5CYaZyzt3YBvYtRtO+aoGlqxPg/B87NGVZ/fu6g==",
++      "dev": true,
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=12"
++      }
++    },
++    "node_modules/whatwg-encoding": {
++      "version": "3.1.1",
++      "resolved": "https://registry.npmjs.org/whatwg-encoding/-/whatwg-encoding-3.1.1.tgz",
++      "integrity": "sha512-6qN4hJdMwfYBtE3YBTTHhoeuUrDBPZmbQaxWAqSALV/MeEnR5z1xd8UKud2RAkFoPkmB+hli1TZSnyi84xz1vQ==",
++      "deprecated": "Use @exodus/bytes instead for a more spec-conformant and faster implementation",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "iconv-lite": "0.6.3"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/whatwg-mimetype": {
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/whatwg-mimetype/-/whatwg-mimetype-4.0.0.tgz",
++      "integrity": "sha512-QaKxh0eNIi2mE9p2vEdzfagOKHCcj1pJ56EEHGQOVxp8r9/iszLUUV7v89x9O1p/T+NlTM5W7jW6+cz4Fq1YVg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/whatwg-url": {
++      "version": "14.2.0",
++      "resolved": "https://registry.npmjs.org/whatwg-url/-/whatwg-url-14.2.0.tgz",
++      "integrity": "sha512-De72GdQZzNTUBBChsXueQUnPKDkg/5A5zp7pFDuQAj5UFoENpiACU0wlCvzpAGnTkj++ihpKwKyYewn/XNUbKw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "tr46": "^5.1.0",
++        "webidl-conversions": "^7.0.0"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/why-is-node-running": {
++      "version": "3.2.1",
++      "resolved": "https://registry.npmjs.org/why-is-node-running/-/why-is-node-running-3.2.1.tgz",
++      "integrity": "sha512-Tb2FUhB4vUsGQlfSquQLYkApkuPAFQXGFzxWKHHumVz2dK+X1RUm/HnID4+TfIGYJ1kTcwOaCk/buYCEJr6YjQ==",
++      "dev": true,
++      "license": "MIT",
++      "bin": {
++        "why-is-node-running": "cli.js"
++      },
++      "engines": {
++        "node": ">=20.11"
++      }
++    },
+     "node_modules/ws": {
+       "version": "8.21.3",
+       "resolved": "https://registry.npmjs.org/ws/-/ws-8.21.3.tgz",
+@@ -1417,6 +2682,23 @@
+         }
+       }
+     },
++    "node_modules/xml-name-validator": {
++      "version": "5.0.0",
++      "resolved": "https://registry.npmjs.org/xml-name-validator/-/xml-name-validator-5.0.0.tgz",
++      "integrity": "sha512-EvGK8EJ3DhaHfbRlETOWAS5pO9MZITeauHKJyb8wyajUfQUenkIg2MvLDTZ4T/TgIcm3HU0TFBgWWboAZ30UHg==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/xmlchars": {
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/xmlchars/-/xmlchars-2.2.0.tgz",
++      "integrity": "sha512-JZnDKK8B0RCDw84FNdDAIpZK+JuJw+s7Lz8nksI7SIuU3UXJJslUthsi+uWBUYOwPFwW7W7PRLRfUKpxjtjFCw==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/xmlhttprequest-ssl": {
+       "version": "2.1.2",
+       "resolved": "https://registry.npmjs.org/xmlhttprequest-ssl/-/xmlhttprequest-ssl-2.1.2.tgz",
+diff --git a/frontend/package.json b/frontend/package.json
+index dd9d868..7f765b9 100644
+--- a/frontend/package.json
++++ b/frontend/package.json
+@@ -7,7 +7,8 @@
+     "dev": "vite",
+     "build": "vite build",
+     "lint": "oxlint",
+-    "preview": "vite preview"
++    "preview": "vite preview",
++    "test": "vitest run"
+   },
+   "dependencies": {
+     "react": "^19.2.8",
+@@ -19,7 +20,9 @@
+     "@types/react": "^19.2.18",
+     "@types/react-dom": "^19.2.7",
+     "@vitejs/plugin-react": "^6.1.1",
++    "jsdom": "^26.1.0",
+     "oxlint": "^1.81.0",
+-    "vite": "^8.3.0"
++    "vite": "^8.3.0",
++    "vitest": "^5.0.4"
+   }
+ }
+diff --git a/frontend/src/pages/Chat.jsx b/frontend/src/pages/Chat.jsx
+index a5051f1..d071886 100644
+--- a/frontend/src/pages/Chat.jsx
++++ b/frontend/src/pages/Chat.jsx
+@@ -14,6 +14,7 @@ import {
+ } from "../components/icons";
+ import { useCall } from "../useCall";
+ import { prepareImage } from "../image";
++import { clearPrivateImages, loadPrivateImage } from "../privateImage";
+ import { API_URL } from "../config";
+ 
+ 
+@@ -137,9 +138,27 @@ function playPing() {
+ /* ---------- Main component ---------- */
+ 
+ // A photo inside the conversation. Tap it to see it full size.
+-function ChatImage({ src, onOpen, onLoaded }) {
++// Photos are private, so they are downloaded with the login token.
++function ChatImage({ path, onOpen, onLoaded }) {
++  const [src, setSrc] = useState(null);
+   const [failed, setFailed] = useState(false);
+ 
++  useEffect(() => {
++    let cancelled = false;
++
++    loadPrivateImage(path)
++      .then((url) => {
++        if (!cancelled) setSrc(url);
++      })
++      .catch(() => {
++        if (!cancelled) setFailed(true);
++      });
++
++    return () => {
++      cancelled = true;
++    };
++  }, [path]);
++
+   if (failed) {
+     return (
+       <div className="flex h-32 w-48 items-center justify-center rounded-2xl bg-slate-800 px-3 text-center text-sm text-slate-400">
+@@ -148,6 +167,10 @@ function ChatImage({ src, onOpen, onLoaded }) {
+     );
+   }
+ 
++  if (!src) {
++    return <div className="h-32 w-48 animate-pulse rounded-2xl bg-slate-800" />;
++  }
++
+   return (
+     <button
+       onClick={() => onOpen(src)}
+@@ -211,6 +234,7 @@ function Chat() {
+   const navigate = useNavigate();
+ 
+   function logout() {
++    clearPrivateImages();
+     clearSession();
+     navigate("/", { replace: true });
+   }
+@@ -566,6 +590,7 @@ function Chat() {
+     function handleCleared({ room }) {
+       const id = String(room).replace("conversation_", "");
+ 
++      clearPrivateImages();
+       setPreviews((previous) => ({ ...previous, [id]: null }));
+       clearUnread(id);
+ 
+@@ -1339,7 +1364,7 @@ function Chat() {
+ 
+                       {msg.message_type === "image" && msg.image_url ? (
+                         <ChatImage
+-                          src={`${API_URL}${msg.image_url}`}
++                          path={msg.image_url}
+                           onOpen={setViewerImage}
+                           onLoaded={scrollToBottom}
+                         />
+@@ -1390,6 +1415,7 @@ function Chat() {
+                 <input
+                   type="text"
+                   placeholder="Write a message..."
++                  maxLength={2000}
+                   value={messageInput}
+                   onChange={(e) => setMessageInput(e.target.value)}
+                   onKeyDown={(e) => {
+diff --git a/frontend/src/privateImage.js b/frontend/src/privateImage.js
+new file mode 100644
+index 0000000..eb88f9a
+--- /dev/null
++++ b/frontend/src/privateImage.js
+@@ -0,0 +1,45 @@
++import { API_URL } from "./config";
++
++// Photos are private, so the browser can't load them with a plain <img src>
++// (that can't send the login token). They are downloaded with the token and
++// shown from a temporary local address instead.
++const cache = new Map(); // photo path -> Promise<local address>
++
++// Only the server's own photo addresses are ever requested. This keeps the
++// login token from being sent anywhere else, whatever a message contains.
++const PHOTO_PATH = /^\/conversations\/[1-9]\d{0,9}\/images\/[a-f0-9]{32}\.(jpg|png|webp)$/;
++
++export function loadPrivateImage(path) {
++  if (typeof path !== "string" || !PHOTO_PATH.test(path)) {
++    return Promise.reject(new Error("Not a photo address"));
++  }
++
++  if (!cache.has(path)) {
++    const request = fetch(`${API_URL}${path}`, {
++      headers: { Authorization: `Bearer ${sessionStorage.getItem("token")}` },
++    })
++      .then(async (response) => {
++        if (!response.ok) throw new Error(`Photo answered ${response.status}`);
++
++        return URL.createObjectURL(await response.blob());
++      })
++      .catch((error) => {
++        // Don't remember failures; the next try should ask again.
++        cache.delete(path);
++        throw error;
++      });
++
++    cache.set(path, request);
++  }
++
++  return cache.get(path);
++}
++
++// Frees the downloaded photos (on log out or when history is deleted).
++export function clearPrivateImages() {
++  for (const request of cache.values()) {
++    request.then((url) => URL.revokeObjectURL(url)).catch(() => {});
++  }
++
++  cache.clear();
++}
+diff --git a/frontend/src/privateImage.test.js b/frontend/src/privateImage.test.js
+new file mode 100644
+index 0000000..598b33e
+--- /dev/null
++++ b/frontend/src/privateImage.test.js
+@@ -0,0 +1,101 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++const PATH = `/conversations/12/images/${"a".repeat(32)}.jpg`;
++const BLOB_URL = "blob:http://localhost/photo-1";
++
++let fetchMock;
++let loadPrivateImage;
++let clearPrivateImages;
++
++beforeEach(async () => {
++  vi.resetModules();
++  sessionStorage.setItem("token", "TOKEN-123");
++
++  fetchMock = vi.fn(async () => ({ ok: true, status: 200, blob: async () => new Blob(["x"]) }));
++  vi.stubGlobal("fetch", fetchMock);
++  URL.createObjectURL = vi.fn(() => BLOB_URL);
++  URL.revokeObjectURL = vi.fn();
++
++  ({ loadPrivateImage, clearPrivateImages } = await import("./privateImage"));
++});
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  sessionStorage.clear();
++});
++
++describe("loadPrivateImage", () => {
++  it("downloads the photo with the login token and returns a local address", async () => {
++    const url = await loadPrivateImage(PATH);
++
++    expect(url).toBe(BLOB_URL);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++
++    const [requested, options] = fetchMock.mock.calls[0];
++    expect(requested).toBe(`http://localhost:3000${PATH}`);
++    expect(options.headers.Authorization).toBe("Bearer TOKEN-123");
++  });
++
++  it("downloads each photo once, even when asked many times at the same moment", async () => {
++    await Promise.all([loadPrivateImage(PATH), loadPrivateImage(PATH), loadPrivateImage(PATH)]);
++    await loadPrivateImage(PATH);
++
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++  });
++
++  it("never sends the token anywhere except the server's own photo addresses", async () => {
++    const bad = [
++      "http://evil.example/photo.jpg",
++      "//evil.example/photo.jpg",
++      "@evil.example/photo.jpg",
++      `/uploads/${"a".repeat(32)}.jpg`,
++      `/conversations/12/images/../../secret`,
++      `/conversations/12/images/${"a".repeat(32)}.jpg?x=1`,
++      `/conversations/12/images/${"a".repeat(32)}.exe`,
++      `/conversations/0/images/${"a".repeat(32)}.jpg`,
++      "",
++      null,
++      undefined,
++      42,
++      {},
++    ];
++
++    for (const path of bad) {
++      await expect(loadPrivateImage(path)).rejects.toThrow("Not a photo address");
++    }
++
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
++  it.each([401, 403, 404, 500])("fails on a %i answer and tries again next time", async (status) => {
++    fetchMock.mockResolvedValueOnce({ ok: false, status, blob: async () => new Blob() });
++
++    await expect(loadPrivateImage(PATH)).rejects.toThrow();
++    expect(await loadPrivateImage(PATH)).toBe(BLOB_URL);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  it("fails when the network is down, without remembering the failure", async () => {
++    fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
++
++    await expect(loadPrivateImage(PATH)).rejects.toThrow("fetch failed");
++    expect(await loadPrivateImage(PATH)).toBe(BLOB_URL);
++  });
++});
++
++describe("clearPrivateImages", () => {
++  it("frees the downloaded photos and forgets them", async () => {
++    await loadPrivateImage(PATH);
++    clearPrivateImages();
++    await Promise.resolve();
++
++    expect(URL.revokeObjectURL).toHaveBeenCalledWith(BLOB_URL);
++
++    await loadPrivateImage(PATH);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  it("is safe to call when nothing was loaded", () => {
++    expect(() => clearPrivateImages()).not.toThrow();
++  });
++});
+diff --git a/frontend/vite.config.js b/frontend/vite.config.js
+index 2adf6cc..69a67fa 100644
+--- a/frontend/vite.config.js
++++ b/frontend/vite.config.js
+@@ -7,4 +7,8 @@ export default defineConfig({
+     react(),
+     tailwindcss(),
+   ],
++  test: {
++    environment: "jsdom",
++    include: ["src/**/*.test.{js,jsx}"],
++  },
+ });
+\ No newline at end of file
