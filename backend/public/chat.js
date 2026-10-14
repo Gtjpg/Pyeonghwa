@@ -219,7 +219,7 @@ function Chat() {
   function markRead(conversationId) {
     clearUnread(conversationId);
 
-    fetch(`http://localhost:3000/conversations/${conversationId}/read`, {
+    fetch(`${API_URL}/conversations/${conversationId}/read`, {
       method: "POST",
       headers: { Authorization: `Bearer ${sessionStorage.getItem("token")}` },
     }).catch((error) => console.error("Mark read error:", error));
